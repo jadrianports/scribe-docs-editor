@@ -1,0 +1,70 @@
+@import "tailwindcss";
+
+/* --- TipTap editor content styling ---
+   We deliberately avoid @tailwindcss/typography to keep dependencies lean and
+   to guarantee the rendered marks/nodes match the server's sanitizer allow-list. */
+.ProseMirror {
+  min-height: 340px;
+  outline: none;
+}
+.ProseMirror:focus {
+  outline: none;
+}
+.ProseMirror > * + * {
+  margin-top: 0.6em;
+}
+.ProseMirror h1 {
+  font-size: 1.9rem;
+  font-weight: 700;
+  line-height: 1.2;
+}
+.ProseMirror h2 {
+  font-size: 1.5rem;
+  font-weight: 700;
+  line-height: 1.25;
+}
+.ProseMirror h3 {
+  font-size: 1.25rem;
+  font-weight: 600;
+}
+.ProseMirror ul {
+  list-style: disc;
+  padding-left: 1.5rem;
+}
+.ProseMirror ol {
+  list-style: decimal;
+  padding-left: 1.5rem;
+}
+.ProseMirror li > p {
+  margin: 0;
+}
+.ProseMirror u {
+  text-decoration: underline;
+}
+.ProseMirror blockquote {
+  border-left: 3px solid #cbd5e1;
+  padding-left: 1rem;
+  color: #475569;
+}
+
+/* --- Print stylesheet for "Export to PDF" ---
+   Hide everything except the document area so the browser's Save-as-PDF captures
+   just the document (title + body). */
+@media print {
+  body * {
+    visibility: hidden;
+  }
+  .document-print,
+  .document-print * {
+    visibility: visible;
+  }
+  .document-print {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    box-shadow: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
+  }
+}
