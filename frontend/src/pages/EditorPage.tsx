@@ -12,7 +12,7 @@ import { canEdit, isOwner, roleBadge } from '../lib/permissions'
 import { useAutosave } from '../hooks/useAutosave'
 import type { SaveStatus } from '../hooks/useAutosave'
 import { useCollab } from '../hooks/useCollab'
-import type { CollabConnection, CollabStatus } from '../hooks/useCollab'
+import type { CollabConnection, CollabStatus, Peer } from '../hooks/useCollab'
 import { useAuth } from '../auth/AuthContext'
 import { Toolbar } from '../components/Toolbar'
 import { ShareModal } from '../components/ShareModal'
@@ -43,6 +43,36 @@ function collabStatusLabel(status: CollabStatus): string {
 function caretColor(userId: number): string {
   const hue = Math.round((userId * 137.508) % 360)
   return `hsl(${hue}, 70%, 45%)`
+}
+
+// "Alice" -> "AL", "Alice Nguyen" -> "AN". Good enough for a small chip; the
+// full name is still available via the tooltip.
+function initials(name: string): string {
+  const parts = name.trim().split(/\s+/).filter(Boolean)
+  if (parts.length === 0) return '?'
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase()
+  return (parts[0][0] + parts[1][0]).toUpperCase()
+}
+
+// "Who's here": one small colored initials chip per connected peer, shown
+// next to the Live/Reconnecting status. Colors come straight from awareness
+// (see `Peer` in useCollab) so they always match that person's caret.
+function PresenceStack({ peers }: { peers: Peer[] }) {
+  if (peers.length === 0) return null
+  return (
+    <div className="hidden items-center -space-x-1.5 sm:flex" aria-label="People viewing this document">
+      {peers.map((peer) => (
+        <span
+          key={peer.clientId}
+          title={peer.self ? `${peer.name} (you)` : peer.name}
+          style={{ backgroundColor: peer.color }}
+          className="flex h-6 w-6 items-center justify-center rounded-full border-2 border-white text-[10px] font-semibold text-white shadow-sm"
+        >
+          {initials(peer.name)}
+        </span>
+      ))}
+    </div>
+  )
 }
 
 export function EditorPage() {
@@ -79,7 +109,7 @@ function EditorInner({ doc }: { doc: DocFull }) {
     [queryClient, doc.id],
   )
   const { status, schedule, flush } = useAutosave(doc.id, editable, onSaved)
-  const { conn, status: collabStatus } = useCollab(doc.id)
+  const { conn, status: collabStatus, peers } = useCollab(doc.id)
 
   // Flush any pending title changes when navigating away from the editor.
   useEffect(() => () => void flush(), [flush])
@@ -103,6 +133,7 @@ function EditorInner({ doc }: { doc: DocFull }) {
         <span className="hidden text-xs text-slate-400 sm:inline">
           {collabStatusLabel(collabStatus)}
         </span>
+        <PresenceStack peers={peers} />
         <span className="hidden text-xs text-slate-400 sm:inline">{titleStatusLabel(status)}</span>
         {!editable && (
           <span className="rounded bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800">
