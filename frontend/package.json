@@ -12,12 +12,16 @@
   },
   "dependencies": {
     "@tanstack/react-query": "^5.101.2",
+    "@tiptap/extension-collaboration": "^3.27.4",
+    "@tiptap/extension-collaboration-caret": "^3.27.4",
     "@tiptap/pm": "^3.27.4",
     "@tiptap/react": "^3.27.4",
     "@tiptap/starter-kit": "^3.27.4",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
-    "react-router-dom": "^7.18.1"
+    "react-router-dom": "^7.18.1",
+    "y-websocket": "^3.0.0",
+    "yjs": "^13.6.31"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.2",
