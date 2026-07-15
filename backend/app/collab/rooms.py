@@ -155,7 +155,17 @@ class RoomManager:
                 # release() is not a hot path.
                 from .snapshot import write_snapshot
 
-                write_snapshot(doc_id, room.ydoc)
+                # A failing snapshot (e.g. a locked DB) must never skip
+                # room.stop() below: doc_id was already popped from
+                # self._rooms/_counts/_room_tasks above (evicted), so nothing
+                # would ever call stop() on THIS room again -- its task
+                # group, its ydoc.observe() subscription, and its YStore
+                # connection would all leak for the life of the process.
+                # Log-and-continue, same pattern as _make_crash_evictor above.
+                try:
+                    write_snapshot(doc_id, room.ydoc)
+                except Exception:
+                    log.error("failed to write snapshot for doc %r", doc_id, exc_info=True)
                 await room.stop()
                 return True
             return False

@@ -195,3 +195,54 @@ def test_hung_room_startup_is_bounded_and_does_not_leak_room_tasks(tmp_path, mon
 
     anyio.run(scenario)
     gc.collect()
+
+
+def test_release_stops_and_evicts_room_even_if_snapshot_write_fails(tmp_path, monkeypatch):
+    """Task 9 fold-in (Task 7 review "Important" finding): `release()` used
+    to call `write_snapshot(doc_id, room.ydoc)` with no try/except before
+    `await room.stop()`. If the snapshot raised (e.g. a locked DB), the
+    exception propagated straight out of release() and `room.stop()` was
+    never reached -- but doc_id had *already* been popped from
+    self._rooms/_counts/_room_tasks by that point (this method pops before
+    snapshotting), so nothing would ever call stop() on this room again: its
+    task group, its ydoc.observe() subscription, and its YStore connection
+    would all leak for the life of the process, and the exception would blow
+    up whatever called release() (the collab WS route's `finally:` block).
+
+    release() must log-and-continue on a snapshot failure (mirroring
+    `_make_crash_evictor`'s pattern above) and unconditionally reach
+    `room.stop()`. Proven two ways: release() must return normally (not
+    raise) with the room still evicted from bookkeeping, AND the room itself
+    must actually have been stopped -- `room._task_group is None` is exactly
+    what `YRoom.stop()` leaves behind (confirmed by reading its source), so
+    it directly distinguishes "stopped" from merely "evicted from the
+    manager's dict but still running in the background."
+    """
+    monkeypatch.chdir(tmp_path)
+
+    from app.collab import snapshot as collab_snapshot
+
+    def raising_write_snapshot(doc_id, ydoc):
+        raise RuntimeError("boom: simulated locked DB")
+
+    monkeypatch.setattr(collab_snapshot, "write_snapshot", raising_write_snapshot)
+
+    async def scenario():
+        mgr = RoomManager()
+
+        with anyio.fail_after(5):
+            room = await mgr.get("doc-snapshot-fail")
+
+        # Must not raise: the old code let write_snapshot's RuntimeError
+        # propagate straight out of release().
+        with anyio.fail_after(5):
+            evicted = await mgr.release("doc-snapshot-fail")
+
+        assert evicted is True
+        assert "doc-snapshot-fail" not in mgr._rooms
+        assert "doc-snapshot-fail" not in mgr._room_tasks
+        assert "doc-snapshot-fail" not in mgr._counts
+        assert room._task_group is None  # i.e. room.stop() actually ran
+
+    anyio.run(scenario)
+    gc.collect()
