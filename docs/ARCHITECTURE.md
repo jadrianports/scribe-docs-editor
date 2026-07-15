@@ -42,6 +42,10 @@ port** (honoring `$PORT`, default 8000). One service, one URL, one thing to depl
 which is exactly what makes the committed [Render Blueprint](../DEPLOY.md) a one-click
 deploy with no orchestration, if and when a live instance is wanted.
 
+(The diagram above shows the REST shape; real-time collaboration is a second, parallel
+entry point into the same FastAPI process — a WebSocket at `/api/collab/{doc_id}` —
+covered in decision #3 below.)
+
 ## Key decisions and tradeoffs
 
 ### 1. Store content as sanitized HTML (not ProseMirror JSON)
@@ -74,15 +78,67 @@ a minimum. Two deliberate behaviors:
 
 Centralizing this means the rules are tested once and can't drift per-endpoint.
 
-### 3. Autosave with a visible status, last-write-wins
-Editing feels most "document-like" when saving is invisible, so edits debounce for
-800 ms and PATCH automatically, with a `Saving… / All changes saved / Save failed`
-indicator and Ctrl-S to force-save. Each save response is written back into the React
-Query cache, so navigating away and reopening a document in-session shows the latest
-content rather than a stale copy. The honest tradeoff: on a document two editors have
-open at once, this is **last-write-wins** — there's no operational-transform or CRDT
-merge. Real-time collaboration was explicitly out of scope; I'd close the concurrency
-gap with version history (below) before attempting true multiplayer.
+### 3. Real-time collaboration: the Y.Doc is authoritative, HTML is derived
+Editing is now genuinely multiplayer. The frontend's TipTap editor binds to a shared
+Yjs document (`@tiptap/extension-collaboration` + `@tiptap/extension-collaboration-caret`)
+synced over a WebSocket at `/api/collab/{doc_id}` into a per-document room (a pycrdt
+`YRoom`), one per currently-open document, managed by a small in-process
+`RoomManager` that ref-counts connections and starts/stops rooms on demand. Every
+editor in a room sees every other editor's keystrokes and cursor live, and Yjs's CRDT
+resolves concurrent edits by **merging** them rather than picking a winner, so two
+people typing in the same paragraph at once both keep their words.
+
+This inverts where "the real content" lives. The **Yjs update stream is now the
+durable source of truth** for a document's body, persisted incrementally to
+`data/yjs.db` via `pycrdt-store`'s `SQLiteYStore` (one file, keyed per document — the
+same zero-ops SQLite philosophy as decision 4). `documents.content_html` — what
+export, the plain document view, and every other non-collaborative reader sees — is
+now a **derived, sanitized snapshot**:
+it's re-rendered from the live Y.Doc (`ydoc_to_html`) and pushed back through the
+*same* `sanitize_html` allow-list every other write path already uses (decision 1's
+invariant holds here too — not a second, divergent sanitizer) when a document's last
+editor disconnects and its room empties. A document that's never been opened for
+collaboration is seeded into its Y.Doc from that same `content_html` the first time
+anyone opens it, guarded so simultaneous first-openers don't each insert their own copy.
+
+Access control rides along unchanged: the WebSocket authenticates off the same session
+cookie and authorizes through the same `effective_role` used everywhere else (decision
+2), then selects one of two channel adapters — a normal read-write channel for
+editor/owner, or a **read-only channel that silently drops a viewer's mutations at the
+transport layer** (not just a disabled toolbar) for viewer. A viewer sees every live
+edit; they just can't make one, and it's enforced server-side — same principle as the
+REST 403, applied to a socket instead of a route.
+
+**Still one Python service, no Node.** `pycrdt` (a Rust-backed Yjs implementation with
+Python bindings) plus `pycrdt-websocket` and `pycrdt-store` do the CRDT work inside the
+same FastAPI process — there is no separate Node-based Yjs server to run, deploy, or
+keep in sync with the Python backend, which is what keeps the "one service, one thing
+to deploy" story (above) true for this feature too.
+
+**The honest tradeoffs**, stated as plainly as decision 1's:
+- **Export/view can lag active editing.** `content_html` only refreshes when a room
+  *empties*, so exporting or plainly viewing a document while people are still
+  actively co-editing it returns content as of the last time everyone had closed it,
+  not the in-progress edits. A live or periodic snapshot while the room stays open is
+  the natural next step (tracked in the README), not a rewrite.
+- **A low-probability seed race.** Two clients opening a document that has never been
+  collaboratively edited before, at the exact same instant, could both observe
+  "not yet seeded" and each insert the saved content before either one's seeded flag
+  propagates — a duplicate-content race with vanishingly small odds in practice (it
+  needs two people to open the same brand-new-to-collaboration document within the
+  same network round-trip) and no corruption risk (Yjs still merges both inserts
+  deterministically), just a cosmetic doubled paragraph.
+- **Single instance only.** Rooms live in one process's memory; nothing fans updates
+  out across instances. Fine for the single-service deploy this project ships
+  (decision 4 already keeps everything to one process), but it's the one piece of this
+  design that would need real infrastructure work — a Redis-backed fan-out — before
+  running behind more than one backend instance (see "If this were going to
+  production," below).
+
+Title edits are the one thing that still goes through the old path: they debounce
+800 ms and PATCH through the REST API exactly as before (`Saving… / All changes saved`
+indicator, Ctrl-S to force-save, each response written back into the React Query
+cache), because a document's title was never part of the shared Yjs body content.
 
 ### 4. SQLite, seeded on boot, no migration tool
 For a single-service take-home, SQLite is the right amount of database: zero setup, one
@@ -116,10 +172,20 @@ resource. On the frontend, the authorization rules are mirrored in a tiny pure-f
 module (`lib/permissions`) that's unit-tested, so the UI's role logic is verified
 independently of React.
 
+The collaboration layer follows the same one-job-per-file split rather than growing
+into one large module: `collab/rooms.py` (room lifecycle and ref-counting),
+`collab/channel.py` (the read-write vs. read-only WebSocket adapter), `collab/html.py`
+(Y.Doc → HTML), `collab/snapshot.py` (the sanitized write-back), and `collab/ystore.py`
+(SQLite persistence) — with `routers/collab.py` itself staying thin, handling only
+auth/origin/role selection before handing off to a room, the same way every REST
+router stays thin around `access.py`.
+
 ## Deliberate scope cuts
 
-- **No real-time collaboration, comments, or version history** — each is a project in
-  itself; last-write-wins is the documented interim behavior.
+- **No comments or version history** — each is a project in itself. Real-time
+  collaboration (decision 3, above) closes the concurrency gap version history was
+  originally meant to hedge against; version history is still cut, but now purely as
+  a "restore an earlier draft" feature in its own right, not a stand-in for multiplayer.
 - **`.txt` / `.md` upload only** — `.docx` needs a heavier converter for marginal
   demonstration value.
 - **Basic-formatting Markdown import** — links / code / tables are outside the aligned
@@ -136,3 +202,15 @@ Render Blueprint already generates one; the compose file still uses the dev defa
 add **version history** to make saves non-destructive; and put the access-control helper
 behind a full integration matrix per role × endpoint rather than the representative
 cases tested today.
+
+Real-time collaboration adds one more: **horizontal scaling for the collab rooms
+themselves.** `RoomManager` today is a single process's in-memory dict — correct and
+sufficient for one instance, but two backend instances behind a load balancer would
+split a document's collaborators into two rooms that never see each other's edits. The
+standard fix is a Redis-backed fan-out (`y-redis`, or hand-rolling the equivalent
+pub/sub bridge between `YRoom`s on different instances) so every instance shares one
+logical room per document regardless of which instance a given client's WebSocket
+lands on. I'd reach for that before ever running more than one instance of this
+service — everything else in this list is already safe to scale horizontally
+(documents and sessions already live in the shared database), but collab rooms
+specifically are not.
