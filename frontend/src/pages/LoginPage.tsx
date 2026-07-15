@@ -4,6 +4,12 @@ import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../auth/AuthContext'
 import { ApiError } from '../api'
 
+const DEMO_ACCOUNTS = [
+  { email: 'alice@example.com', note: 'owns docs, shares the roadmap' },
+  { email: 'bob@example.com', note: 'editor on the roadmap' },
+  { email: 'carol@example.com', note: 'viewer on the roadmap' },
+]
+
 export function LoginPage() {
   const { login } = useAuth()
   const navigate = useNavigate()
@@ -43,7 +49,7 @@ export function LoginPage() {
               required
               value={email}
               onChange={(e) => setEmail(e.target.value)}
-              className="mt-1 w-full rounded border border-slate-300 px-3 py-2 text-sm focus:border-slate-500 focus:outline-none"
+              className="mt-1 w-full rounded border border-slate-300 px-3 py-2 text-sm focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-300"
             />
           </div>
           <div>
@@ -56,14 +62,14 @@ export function LoginPage() {
               required
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              className="mt-1 w-full rounded border border-slate-300 px-3 py-2 text-sm focus:border-slate-500 focus:outline-none"
+              className="mt-1 w-full rounded border border-slate-300 px-3 py-2 text-sm focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-300"
             />
           </div>
           {error && <p className="text-sm text-red-600">{error}</p>}
           <button
             type="submit"
             disabled={busy}
-            className="w-full rounded bg-slate-800 py-2 text-sm font-medium text-white hover:bg-slate-700 disabled:opacity-50"
+            className="w-full rounded bg-slate-800 py-2 text-sm font-medium text-white transition-colors hover:bg-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400 focus-visible:ring-offset-1 disabled:cursor-not-allowed disabled:opacity-50"
           >
             {busy ? 'Signing in…' : 'Sign in'}
           </button>
@@ -71,12 +77,25 @@ export function LoginPage() {
 
         <div className="mt-6 rounded-lg bg-slate-50 p-3 text-xs text-slate-500">
           <p className="font-medium text-slate-600">
-            Demo accounts (password <code className="rounded bg-slate-200 px-1">demo1234</code>):
+            Demo accounts (password <code className="rounded bg-slate-200 px-1">demo1234</code>) —
+            click to fill:
           </p>
           <ul className="mt-1 space-y-0.5">
-            <li>alice@example.com — owns docs, shares the roadmap</li>
-            <li>bob@example.com — editor on the roadmap</li>
-            <li>carol@example.com — viewer on the roadmap</li>
+            {DEMO_ACCOUNTS.map((acct) => (
+              <li key={acct.email}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEmail(acct.email)
+                    setPassword('demo1234')
+                    setError('')
+                  }}
+                  className="w-full rounded px-1 py-0.5 text-left hover:bg-slate-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400"
+                >
+                  <span className="font-medium text-slate-700">{acct.email}</span> — {acct.note}
+                </button>
+              </li>
+            ))}
           </ul>
         </div>
       </div>

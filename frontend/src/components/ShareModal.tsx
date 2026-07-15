@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, ApiError } from '../api'
 import type { Role, Share } from '../api'
@@ -9,6 +9,15 @@ export function ShareModal({ docId, onClose }: { docId: string; onClose: () => v
   const [email, setEmail] = useState('')
   const [role, setRole] = useState<Role>('viewer')
   const [error, setError] = useState('')
+
+  // Close on Escape, like a native dialog.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
 
   const sharesQuery = useQuery({
     queryKey: ['shares', docId],
@@ -27,7 +36,11 @@ export function ShareModal({ docId, onClose }: { docId: string; onClose: () => v
 
   const revoke = useMutation({
     mutationFn: (userId: number) => api.del(`/documents/${docId}/shares/${userId}`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['shares', docId] }),
+    onSuccess: () => {
+      setError('')
+      qc.invalidateQueries({ queryKey: ['shares', docId] })
+    },
+    onError: (e) => setError(e instanceof ApiError ? e.message : 'Could not remove access'),
   })
 
   const shares = sharesQuery.data ?? []
@@ -38,12 +51,21 @@ export function ShareModal({ docId, onClose }: { docId: string; onClose: () => v
       onClick={onClose}
     >
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="share-modal-title"
         className="w-full max-w-md rounded-lg bg-white p-5 shadow-xl"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="mb-4 flex items-center justify-between">
-          <h2 className="text-lg font-semibold text-slate-800">Share document</h2>
-          <button onClick={onClose} className="text-slate-400 hover:text-slate-600" aria-label="Close">
+          <h2 id="share-modal-title" className="text-lg font-semibold text-slate-800">
+            Share document
+          </h2>
+          <button
+            onClick={onClose}
+            className="rounded text-slate-400 hover:text-slate-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400"
+            aria-label="Close"
+          >
             ✕
           </button>
         </div>
@@ -53,20 +75,21 @@ export function ShareModal({ docId, onClose }: { docId: string; onClose: () => v
             e.preventDefault()
             if (email.trim()) addShare.mutate()
           }}
-          className="flex gap-2"
+          className="flex flex-col gap-2 sm:flex-row"
         >
           <input
             type="email"
             required
+            autoFocus
             placeholder="teammate@example.com"
             value={email}
             onChange={(e) => setEmail(e.target.value)}
-            className="flex-1 rounded border border-slate-300 px-2 py-1.5 text-sm focus:border-slate-500 focus:outline-none"
+            className="flex-1 rounded border border-slate-300 px-2 py-1.5 text-sm focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-300"
           />
           <select
             value={role}
             onChange={(e) => setRole(e.target.value as Role)}
-            className="rounded border border-slate-300 px-2 py-1.5 text-sm"
+            className="rounded border border-slate-300 px-2 py-1.5 text-sm focus:border-slate-500 focus:outline-none focus:ring-2 focus:ring-slate-300"
           >
             <option value="viewer">Viewer</option>
             <option value="editor">Editor</option>
@@ -74,9 +97,9 @@ export function ShareModal({ docId, onClose }: { docId: string; onClose: () => v
           <button
             type="submit"
             disabled={addShare.isPending}
-            className="rounded bg-slate-800 px-3 py-1.5 text-sm text-white hover:bg-slate-700 disabled:opacity-50"
+            className="rounded bg-slate-800 px-3 py-1.5 text-sm text-white transition-colors hover:bg-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400 focus-visible:ring-offset-1 disabled:cursor-not-allowed disabled:opacity-50"
           >
-            Add
+            {addShare.isPending ? 'Adding…' : 'Add'}
           </button>
         </form>
         {error && <p className="mt-2 text-sm text-red-600">{error}</p>}
@@ -94,7 +117,8 @@ export function ShareModal({ docId, onClose }: { docId: string; onClose: () => v
                 <span className="text-xs font-medium text-slate-500">{roleBadge(s.role)}</span>
                 <button
                   onClick={() => revoke.mutate(s.user_id)}
-                  className="text-red-600 hover:underline"
+                  disabled={revoke.isPending}
+                  className="rounded text-red-600 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-300 disabled:opacity-50"
                 >
                   Remove
                 </button>

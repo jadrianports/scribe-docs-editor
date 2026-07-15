@@ -28,8 +28,14 @@ export function DashboardPage() {
       qc.invalidateQueries({ queryKey: ['documents'] })
       navigate(`/documents/${doc.id}`)
     },
-    onError: (e) => alert(e instanceof ApiError ? e.message : 'Upload failed'),
   })
+
+  const actionError = uploadDoc.error ?? createDoc.error
+  const actionErrorMessage = actionError
+    ? actionError instanceof ApiError
+      ? actionError.message
+      : 'Something went wrong. Please try again.'
+    : null
 
   return (
     <div className="min-h-screen bg-slate-50">
@@ -39,7 +45,7 @@ export function DashboardPage() {
           <span className="text-slate-500">{user?.name}</span>
           <button
             onClick={() => logout()}
-            className="rounded border border-slate-300 px-2 py-1 hover:bg-slate-100"
+            className="rounded border border-slate-300 px-2 py-1 transition-colors hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400"
           >
             Log out
           </button>
@@ -47,18 +53,18 @@ export function DashboardPage() {
       </header>
 
       <main className="mx-auto max-w-5xl px-6 py-8">
-        <div className="mb-8 flex flex-wrap gap-2">
+        <div className="mb-2 flex flex-wrap items-center gap-2">
           <button
             onClick={() => createDoc.mutate()}
             disabled={createDoc.isPending}
-            className="rounded bg-slate-800 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700 disabled:opacity-50"
+            className="rounded bg-slate-800 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400 focus-visible:ring-offset-1 disabled:cursor-not-allowed disabled:opacity-50"
           >
             + New document
           </button>
           <button
             onClick={() => fileInput.current?.click()}
             disabled={uploadDoc.isPending}
-            className="rounded border border-slate-300 px-4 py-2 text-sm text-slate-700 hover:bg-slate-100 disabled:opacity-50"
+            className="rounded border border-slate-300 px-4 py-2 text-sm text-slate-700 transition-colors hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400 disabled:cursor-not-allowed disabled:opacity-50"
           >
             {uploadDoc.isPending ? 'Uploading…' : 'Upload .txt / .md'}
           </button>
@@ -74,11 +80,29 @@ export function DashboardPage() {
             }}
           />
         </div>
+        <p className="mb-6 text-xs text-slate-400">
+          Upload a <code className="rounded bg-slate-100 px-1">.txt</code> or{' '}
+          <code className="rounded bg-slate-100 px-1">.md</code> file (max 1&nbsp;MB). Import
+          preserves basic formatting — headings, bold, italic, and lists.
+        </p>
+        {actionErrorMessage && (
+          <p className="mb-6 rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+            {actionErrorMessage}
+          </p>
+        )}
 
         {docsQuery.isLoading ? (
-          <p className="text-slate-500">Loading documents…</p>
+          <DashboardSkeleton />
         ) : docsQuery.isError ? (
-          <p className="text-red-600">Could not load documents.</p>
+          <div className="text-sm">
+            <p className="text-red-600">Could not load your documents.</p>
+            <button
+              onClick={() => docsQuery.refetch()}
+              className="mt-2 rounded border border-slate-300 px-3 py-1 transition-colors hover:bg-slate-100"
+            >
+              Try again
+            </button>
+          </div>
         ) : (
           <div className="space-y-10">
             <Section
@@ -127,5 +151,27 @@ function Section({
         </div>
       )}
     </section>
+  )
+}
+
+// Skeleton that mirrors the real card grid, so loading reads as "content is
+// arriving here" rather than a bare line of gray text.
+function DashboardSkeleton() {
+  return (
+    <div className="space-y-10">
+      {[0, 1].map((section) => (
+        <div key={section}>
+          <div className="mb-3 h-4 w-40 animate-pulse rounded bg-slate-200" />
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            {Array.from({ length: 3 }).map((_, i) => (
+              <div
+                key={i}
+                className="h-32 animate-pulse rounded-lg border border-slate-200 bg-white"
+              />
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
   )
 }
