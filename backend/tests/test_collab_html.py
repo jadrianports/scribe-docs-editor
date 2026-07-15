@@ -235,6 +235,27 @@ def test_mapped_block_misplaced_inside_paragraph_is_sanitizer_stable():
     assert sanitize_html(html) == html
 
 
+def test_heading_level_infinite_falls_back_to_h1():
+    # A third exception shape, on top of the non-numeric-string/None cases
+    # above: `int(float("inf"))` raises OverflowError, which the earlier
+    # `except (TypeError, ValueError)` fix does not cover. Confirmed
+    # empirically (`int(raw)` where `raw = dict(node.attributes)["level"]`
+    # is the float `inf`, not a string) before writing this test. Task 7
+    # calls ydoc_to_html to build room-empty snapshots -- a crash here would
+    # break that document's snapshot, so this must fall back to h1 same as
+    # the other two malformed-level shapes.
+    doc = Doc()
+    frag = _fragment(doc)
+    heading = XmlElement("heading", {"level": float("inf")})
+    frag.children.append(heading)
+    heading.children.append(XmlText("Odd"))
+
+    html = ydoc_to_html(doc)
+
+    assert html == "<h1>Odd</h1>"
+    assert sanitize_html(html) == html
+
+
 def test_heading_misplaced_inside_heading_is_sanitizer_stable():
     # Same inline-context hazard, the heading half: html5lib pops an open
     # heading when it meets ANOTHER heading start tag (empirically verified

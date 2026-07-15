@@ -172,11 +172,20 @@ def _heading_level(node: XmlElement) -> int | None:
     Task 7 calls ydoc_to_html to build snapshots -- a crash here must never
     propagate. Callers look up the result in `_HEADING_TAGS`, which falls
     back to h1 for None same as it does for an out-of-range int.
+
+    Catches `Exception` broadly rather than enumerating types one at a time:
+    `int(raw)` was first confirmed to raise `ValueError` (non-numeric string)
+    and `TypeError` (None); Task 7 found a third, distinct shape empirically
+    -- `int(float("inf"))` raises `OverflowError`, which neither of those
+    covers. Given the "Never raises" contract above and that every malformed
+    `level` found so far has raised its own exception type, catching broadly
+    here is more robust than continuing to whack-a-mole individual exception
+    classes as new malformed inputs surface.
     """
     raw = dict(node.attributes).get("level", 1)
     try:
         return int(raw)
-    except (TypeError, ValueError):
+    except Exception:
         return None
 
 
