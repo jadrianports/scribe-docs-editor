@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Node / frontend
+node_modules/
+frontend/dist/
+dist/
+*.local
+
+# Data / secrets
+data/
+*.db
+*.sqlite
+*.sqlite3
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Build
+*.log
+
+# Local tooling / assistant config — not part of the project
+.claude/
+.cursor/
+.aider*
+CLAUDE.md
+AGENTS.md
+docs/superpowers/
