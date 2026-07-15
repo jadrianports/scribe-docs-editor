@@ -68,7 +68,7 @@ lit up correctly. The fix and the reason are commented at
 ## Two parallel review agents, two more real bugs
 
 Running two AI review passes in parallel during UAT surfaced two defects of the classic
-"state / integration bug unit tests miss" kind — both fixed before the public deploy:
+"state / integration bug unit tests miss" kind — both fixed before shipping:
 
 - **Path-traversal in the SPA static-file fallback.** FastAPI serves the built SPA under
   a catch-all route; a crafted `/../../` path could escape the `dist` directory and read

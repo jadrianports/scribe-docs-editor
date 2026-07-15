@@ -4,11 +4,13 @@ A small full-stack **rich-text document editor**: create, rename, edit, autosave
 and reopen documents; upload a `.txt` / `.md` file to start a new one; share with
 viewer / editor roles; export to Markdown or PDF. Built as a focused product slice —
 a usable editing flow, a sharing model that is actually enforced, and the
-engineering scaffolding (validation, tests, one-command run, live deploy) around them.
+engineering scaffolding (validation, tests, one-command run) around them.
 
-- **Live demo:** `https://<your-app>.onrender.com` *(paste the Render URL here once deployed)*
 - **Run locally:** `docker compose up --build` → **http://localhost:8000**
 - **Log in with:** `alice@example.com` / `demo1234` (two more accounts below)
+- **Deploy-ready:** a one-click Render Blueprint ([`render.yaml`](render.yaml) +
+  [`DEPLOY.md`](DEPLOY.md)) is included, but no instance is hosted right now —
+  delivery is local-first (see [Deployment](#deployment) for the reasoning).
 
 ![Dashboard](docs/screenshots/scribe-dashboard.png)
 
@@ -53,20 +55,25 @@ restarts**. To start completely fresh, delete the `./data/` folder.
 
 ---
 
-## Live deployment
+## Deployment
 
-Scribe is deployed **live on Render** (free tier, no credit card) as a **single Docker
-service** built straight from this repo — FastAPI serves the built SPA *and* the API
-on one port, so there is one thing to deploy and one URL to share. Full step-by-step
-instructions are in **[`DEPLOY.md`](DEPLOY.md)**.
+Delivery is **local-first**: `docker compose up --build` plus this public repo. There
+is **no hosted instance running right now** — a deliberate choice so reviewers get a
+reliable local run instead of depending on a free tier that cold-starts and resets.
 
-> **Persistence on the live demo (stated honestly):** Render's free instance has an
-> ephemeral disk, so the SQLite DB resets on restart/redeploy. The app **re-seeds on
-> every boot**, so the demo users and the pre-shared "Project Roadmap" are always
-> present and the sharing flow is always demonstrable; documents a reviewer creates
-> persist until the next restart. Running locally (above) persists normally via the
-> `./data` volume. Durable cloud storage (a persistent volume or managed Postgres via
-> `DATABASE_URL`) is a documented next step, not a rewrite.
+That said, the app is **deploy-ready as a single service**: FastAPI serves the built
+SPA *and* the API on one port, and the container honors the platform's `$PORT`. A
+committed **[`render.yaml`](render.yaml)** Blueprint plus **[`DEPLOY.md`](DEPLOY.md)**
+make a live Render deploy a ~5-minute, one-click step whenever it's wanted — no code
+changes, just an "Apply" in Render. (An earlier draft targeted Koyeb, but Koyeb was
+acquired by Mistral and shut down its self-serve deploy product; `DEPLOY.md` notes
+this.)
+
+Because the deploy would use SQLite on a free ephemeral disk, it **re-seeds on every
+boot**, so the demo users and the pre-shared "Project Roadmap" always come back and the
+sharing flow is always demonstrable. Local runs persist normally via the `./data`
+volume. Durable cloud storage (a persistent volume or managed Postgres via
+`DATABASE_URL`) is a documented next step, not a rewrite.
 
 ---
 
@@ -108,8 +115,9 @@ npm run dev                        # Vite dev server on http://localhost:5173
 ```
 
 Open **http://localhost:5173**. The Vite dev server proxies `/api` to the backend on
-port 8000, so both halves work together with hot reload. (In Docker and on Render there
-is no proxy — FastAPI serves the pre-built frontend directly on the single port.)
+port 8000, so both halves work together with hot reload. (In Docker, and in any
+container deploy, there is no proxy — FastAPI serves the pre-built frontend directly on
+the single port.)
 
 ---
 
@@ -161,8 +169,9 @@ two real bugs it caught that the unit tests could not).
 - **Autosave is last-write-wins** — no operational-transform / CRDT merge, and no
   real-time collaboration. On a document two editors have open at once, the last save
   wins.
-- **The live Render instance uses a free ephemeral disk** — it re-seeds on boot (see
-  the deployment note above). Local runs persist via the `./data` volume.
+- **No hosted instance is running** — delivery is local-first (see
+  [Deployment](#deployment)). The included one-click Render deploy would use a free
+  ephemeral disk that re-seeds on boot; local runs persist via the `./data` volume.
 
 ---
 
@@ -176,7 +185,9 @@ two real bugs it caught that the unit tests could not).
 - Markdown + PDF export
 - Persistence across refresh and restarts (SQLite volume locally)
 - Automated tests (12 backend + 3 frontend), clean `tsc --noEmit`, one-command Docker run
-- **Deployed live on Render** as a single service (see [`DEPLOY.md`](DEPLOY.md))
+- **Deploy-ready** as a single service — one-click Render Blueprint
+  ([`render.yaml`](render.yaml) + [`DEPLOY.md`](DEPLOY.md)); delivered local-first (not
+  currently hosted)
 
 **Intentionally deprioritized:**
 - Real-time collaboration, comments, and version history — each is a project in itself.

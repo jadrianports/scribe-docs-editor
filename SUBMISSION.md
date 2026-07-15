@@ -1,11 +1,12 @@
 # Submission — Scribe
 
 A full-stack rich-text document editor with sharing, built for the take-home
-assessment. **Deployed live on Render and runnable locally with one command.**
+assessment. **Runnable locally with one command; packaged deploy-ready.**
 
-- **Live demo:** `https://<your-app>.onrender.com` *(paste the Render URL here once deployed)*
 - **Run locally:** `docker compose up --build` → http://localhost:8000
 - **Log in:** `alice@example.com` / `demo1234`
+- **Deploy-ready:** one-click Render Blueprint ([`render.yaml`](render.yaml) +
+  [`DEPLOY.md`](DEPLOY.md)) — no instance is hosted right now; delivery is local-first.
 
 ## What's included
 
@@ -24,9 +25,7 @@ assessment. **Deployed live on Render and runnable locally with one command.**
 
 ## How to run (for reviewers)
 
-Fastest path — just open the **live demo** URL above and log in.
-
-To run it yourself:
+One command from the repo root:
 
 ```bash
 docker compose up --build
@@ -62,27 +61,28 @@ the two grants → log out → sign in as **Bob** (edits the shared doc) → the
 - [x] Validation + error handling (typed API errors, friendly UI states)
 - [x] Automated tests (12 backend + 3 frontend), clean `tsc --noEmit`
 - [x] One-command run reviewers can use (`docker compose up`)
-- [x] **Live deployment** (single Docker service on Render)
+- [x] **Deploy-ready** — one-click Render Blueprint + guide (delivered local-first)
 - [x] Architecture note + AI workflow note
 - [x] Stretch: export to Markdown and PDF
 
 ## Deployment note
 
-Scribe is **deployed live on Render** (free tier, no credit card) as a single Docker
-service built from this repo — FastAPI serves the built SPA and the API on one port, so
-there is one thing to deploy and one URL to share. Step-by-step instructions are in
-[`DEPLOY.md`](DEPLOY.md).
+Delivery is **local-first** — `docker compose up --build` plus this public repo — with
+**no hosted instance running right now**. That's a deliberate choice: reviewers get a
+reliable local run rather than depending on a free tier that cold-starts and resets.
 
-Render's free instance has an ephemeral disk, so the SQLite DB resets on restart — but the
-app **re-seeds on every boot**, so the demo users and the pre-shared "Project Roadmap"
-are always present and the sharing flow is always demonstrable; reviewer-created docs
-persist until the next restart. Local runs persist normally via the `./data` volume.
-Durable cloud storage (persistent volume or managed Postgres) is a documented next step.
+The app is nonetheless **deploy-ready as a single service**: FastAPI serves the built SPA
+and the API on one port, the container honors `$PORT`, and a committed
+[`render.yaml`](render.yaml) Blueprint plus [`DEPLOY.md`](DEPLOY.md) make a live Render
+deploy a ~5-minute, one-click step. (An earlier draft targeted Koyeb, which was acquired
+by Mistral and shut down its self-serve deploy product — noted in `DEPLOY.md`.) A deploy
+would use SQLite on a free ephemeral disk that re-seeds on boot, so the demo is always
+present; durable storage (a volume or managed Postgres) is a documented next step.
 
 ## Status summary
 
 - **Working:** every core feature above, verified via automated tests, a real-browser
-  walkthrough of all three roles, and a clean-container `docker compose up`. Deployed live.
+  walkthrough of all three roles, and a clean-container `docker compose up`.
 - **Deferred:** real-time collaboration, comments, version history, `.docx` upload,
   wider Markdown import (links / code), self-serve registration. Rationale in the
   architecture note.

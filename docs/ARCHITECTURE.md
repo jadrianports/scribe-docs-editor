@@ -16,8 +16,9 @@ spent my time on the things a reviewer can actually judge:
    literally cannot edit), but the UI is not the enforcement boundary — the API is.
 3. **Engineering scaffolding that shows how I work.** Request validation, a consistent
    error contract, a meaningful test suite, a genuine one-command run
-   (`docker compose up`) I verified against a clean container, and a **live single-service
-   deploy** on Render.
+   (`docker compose up`) I verified against a clean container, and a **deploy-ready
+   single-service image** (a committed one-click Render Blueprint; delivery is
+   local-first, with no instance currently hosted).
 
 Everything else was consciously cut or deferred (see the end of this note).
 
@@ -38,8 +39,8 @@ In development the two halves run separately (Vite on 5173 proxies `/api` to Uvi
 on 8000). In production a **multi-stage Docker image** builds the SPA with Node, then
 hands the static bundle to FastAPI, which serves both the API and the app on **one
 port** (honoring `$PORT`, default 8000). One service, one URL, one thing to deploy —
-which is exactly what makes the [Render deploy](../DEPLOY.md) a single web service with
-no orchestration.
+which is exactly what makes the committed [Render Blueprint](../DEPLOY.md) a one-click
+deploy with no orchestration, if and when a live instance is wanted.
 
 ## Key decisions and tradeoffs
 
@@ -86,8 +87,8 @@ gap with version history (below) before attempting true multiplayer.
 ### 4. SQLite, seeded on boot, no migration tool
 For a single-service take-home, SQLite is the right amount of database: zero setup, one
 file, trivially shippable in a container volume. I create tables on startup and seed
-demo data only if the users table is empty (idempotent), which is also what keeps the
-live Render demo working across its ephemeral-disk restarts. I deliberately did **not**
+demo data only if the users table is empty (idempotent), which is also what would keep a
+Render deploy working across its ephemeral-disk restarts. I deliberately did **not**
 add Alembic — migrations are the correct call for a living schema, but here they'd be
 scaffolding without a payoff.
 
@@ -104,7 +105,8 @@ Because FastAPI serves the built SPA under a catch-all route, that route resolve
 requested path with `realpath` and serves a file only if it stays inside the `dist`
 directory, otherwise it falls back to `index.html`. This is what lets client-side
 routing work while preventing a crafted `/../../` request from escaping the static root
-(a path-traversal read) — a small but real hardening step for a publicly deployed app.
+(a path-traversal read) — a small but real hardening step for an app packaged to be
+publicly deployable.
 
 ## Where the boundaries are
 
@@ -127,9 +129,10 @@ independently of React.
 
 ## If this were going to production
 
-The first changes I'd make: give the live instance **durable storage** (a Render
+The first changes I'd make: give a deployed instance **durable storage** (a Render
 persistent volume or managed Postgres via `DATABASE_URL`) so data survives restarts;
-move sessions to a shared store and keep `SECRET_KEY` as a real rotated secret (already
-set on the Render deploy, still the dev default in the compose file); add **version
-history** to make saves non-destructive; and put the access-control helper behind a full
-integration matrix per role × endpoint rather than the representative cases tested today.
+move sessions to a shared store and keep `SECRET_KEY` as a real rotated secret (the
+Render Blueprint already generates one; the compose file still uses the dev default);
+add **version history** to make saves non-destructive; and put the access-control helper
+behind a full integration matrix per role × endpoint rather than the representative
+cases tested today.

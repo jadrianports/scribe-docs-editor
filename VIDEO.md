@@ -12,12 +12,12 @@ pre-flight checklist is at the bottom; do it before you hit record.
 ## Shot list
 
 ### (0:00) — Intro (~20s)
-- **[ON SCREEN]** The live demo open in a browser at the Render URL (login screen), tab
-  visible. Have `docker compose up` running in a terminal you can flash briefly.
+- **[ON SCREEN]** The app open at `http://localhost:8000` (login screen). Have
+  `docker compose up` running in a terminal you can flash briefly.
 - **[SAY]** "This is Scribe — a rich-text document editor with sharing, export, and
-  file upload. It's **deployed live on Render**, and it also runs locally with a single
-  command — `docker compose up` on port 8000. Same single Docker image both places:
-  FastAPI serves the React app and the API on one port. Let me walk through it."
+  file upload. It runs with a single command — `docker compose up` on port 8000 — as
+  one Docker image where FastAPI serves the React app and the API on one port. It's also
+  packaged deploy-ready with a one-click Render Blueprint. Let me walk through it."
 
 ### (0:20) — Log in, create, rename, format, autosave (~60s)
 - **[ON SCREEN]** Log in as `alice@example.com` / `demo1234`. On the dashboard, click
@@ -76,17 +76,16 @@ pre-flight checklist is at the bottom; do it before you hit record.
   bug unit tests couldn't**: the toolbar buttons did nothing on click, because mousedown
   was collapsing the editor selection — fixed by preventing default on mousedown. And a
   **parallel review pass caught a path-traversal security bug** in the static file server
-  before it went public. AI accelerated the build *and* the adversarial testing; the
-  design decisions stayed mine. Thanks for watching."
+  and I hardened it before shipping. AI accelerated the build *and* the adversarial
+  testing; the design decisions stayed mine. Thanks for watching."
 
 ---
 
 ## 15-second pre-flight checklist (do this before recording)
 
-- [ ] **Fresh start:** `docker compose up --build` running clean (or the live Render URL
-      loaded and healthy).
-- [ ] **Browser ready:** pointed at the **live URL** or **http://localhost:8000**,
-      **logged out**, cache/other tabs closed.
+- [ ] **Fresh start:** `docker compose up --build` running clean.
+- [ ] **Browser ready:** pointed at **http://localhost:8000**, **logged out**,
+      cache/other tabs closed.
 - [ ] **Window sized:** browser sized so the toolbar, autosave indicator, and dashboard
       sections are all visible; zoom ~110% for legibility.
 - [ ] **Demo file ready:** a small `.md` file with a heading, bold, and a list on the
