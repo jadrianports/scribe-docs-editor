@@ -1,7 +1,7 @@
 import asyncio
 import logging
 
-from anyio import Lock
+from anyio import Lock, fail_after
 from pycrdt import Doc
 from pycrdt.store import YDocNotFound
 from pycrdt.websocket import YRoom
@@ -10,13 +10,21 @@ from .ystore import ScribeYStore
 
 log = logging.getLogger(__name__)
 
+# A room's startup (SQLite rehydration + the two YRoom readiness events) runs
+# while `get()` holds the single lock shared by get()/release() for EVERY
+# doc_id (see `_create_room`'s docstring). Bounding it means a hung/crashed
+# startup for one doc_id can only ever stall other doc_ids for "a few
+# seconds," not forever (Task 3 review, "Important" finding).
+DEFAULT_STARTUP_TIMEOUT = 5.0
+
 
 class RoomManager:
-    def __init__(self) -> None:
+    def __init__(self, startup_timeout: float = DEFAULT_STARTUP_TIMEOUT) -> None:
         self._rooms: dict[str, YRoom] = {}
         self._room_tasks: dict[str, asyncio.Task] = {}
         self._counts: dict[str, int] = {}
         self._lock = Lock()
+        self._startup_timeout = startup_timeout
 
     def _make_crash_evictor(self, doc_id: str, room: YRoom):
         """Build the done-callback for `room`'s background `start()` task.
@@ -59,6 +67,40 @@ class RoomManager:
         async with self._lock:
             room = self._rooms.get(doc_id)
             if room is None:
+                room = await self._create_room(doc_id)
+                self._rooms[doc_id] = room
+                self._counts[doc_id] = 0
+            self._counts[doc_id] += 1
+            return room
+
+    async def _create_room(self, doc_id: str) -> YRoom:
+        """Build and start a fresh room for `doc_id`.
+
+        Called from `get()` while `self._lock` -- the single lock shared by
+        get()/release() for EVERY doc_id -- is held. Before this method
+        existed, `get()` awaited the rehydration read and both YRoom readiness
+        events (`started`, `ydoc_observed`) inline, with no timeout: a room
+        that hung during startup (or whose background task crashed without
+        ever completing that readiness handshake -- from here, an Event that
+        will never be set looks identical either way) would hold the lock
+        forever, wedging get()/release() for every OTHER document too (Task 3
+        review, "Important" finding). `anyio.fail_after` bounds the whole
+        sequence to `self._startup_timeout` seconds, so the worst case becomes
+        "a few seconds," not "forever."
+
+        On any failure -- timeout or a genuine exception (e.g. from SQLite) --
+        `self._rooms`/`self._counts` are untouched (this method's return value
+        is only cached by `get()` on success), but `self._room_tasks[doc_id]`
+        may already have been set if the room's start() task was created
+        before the failure -- clean that up too (and cancel the task) so a
+        later get() for the same doc_id doesn't inherit a stale entry that
+        nothing would otherwise ever evict (the crash-evictor's
+        `self._rooms.get(doc_id) is room` guard never fires for a room that
+        was never cached).
+        """
+        task: asyncio.Task | None = None
+        try:
+            with fail_after(self._startup_timeout):
                 ydoc = Doc()
                 store = ScribeYStore(path=doc_id)
                 async with store as s:              # start the store to read history
@@ -87,10 +129,13 @@ class RoomManager:
                 # reading `pycrdt/websocket/yroom.py` after this race
                 # reproduced deterministically (empty YStore after an insert).
                 await room.ydoc_observed.wait()
-                self._rooms[doc_id] = room
-                self._counts[doc_id] = 0
-            self._counts[doc_id] += 1
             return room
+        except BaseException:
+            log.error("collab room %r failed to start", doc_id, exc_info=True)
+            self._room_tasks.pop(doc_id, None)
+            if task is not None:
+                task.cancel()
+            raise
 
     async def release(self, doc_id: str) -> bool:
         async with self._lock:
