@@ -1,9 +1,9 @@
 # Submission — Scribe
 
 A full-stack rich-text document editor with sharing, built for the take-home
-assessment. **Deployed live on Koyeb and runnable locally with one command.**
+assessment. **Deployed live on Render and runnable locally with one command.**
 
-- **Live demo:** `https://<your-app>.koyeb.app` *(paste the Koyeb URL here once deployed)*
+- **Live demo:** `https://<your-app>.onrender.com` *(paste the Render URL here once deployed)*
 - **Run locally:** `docker compose up --build` → http://localhost:8000
 - **Log in:** `alice@example.com` / `demo1234`
 
@@ -16,7 +16,7 @@ assessment. **Deployed live on Koyeb and runnable locally with one command.**
 | **README** (setup + run) | [`README.md`](README.md) |
 | **Architecture note** | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) |
 | **AI workflow note** | [`docs/AI_WORKFLOW.md`](docs/AI_WORKFLOW.md) |
-| **Deploy guide (Koyeb)** | [`DEPLOY.md`](DEPLOY.md) |
+| **Deploy guide (Render)** | [`DEPLOY.md`](DEPLOY.md) |
 | **Walkthrough video link** | [`VIDEO.md`](VIDEO.md) |
 | **This submission index** | [`SUBMISSION.md`](SUBMISSION.md) |
 | **Screenshots** | [`docs/screenshots/`](docs/screenshots/) |
@@ -62,18 +62,18 @@ the two grants → log out → sign in as **Bob** (edits the shared doc) → the
 - [x] Validation + error handling (typed API errors, friendly UI states)
 - [x] Automated tests (12 backend + 3 frontend), clean `tsc --noEmit`
 - [x] One-command run reviewers can use (`docker compose up`)
-- [x] **Live deployment** (single Docker service on Koyeb)
+- [x] **Live deployment** (single Docker service on Render)
 - [x] Architecture note + AI workflow note
 - [x] Stretch: export to Markdown and PDF
 
 ## Deployment note
 
-Scribe is **deployed live on Koyeb** (free tier, no credit card) as a single Docker
+Scribe is **deployed live on Render** (free tier, no credit card) as a single Docker
 service built from this repo — FastAPI serves the built SPA and the API on one port, so
 there is one thing to deploy and one URL to share. Step-by-step instructions are in
 [`DEPLOY.md`](DEPLOY.md).
 
-Koyeb's free instance has an ephemeral disk, so the SQLite DB resets on restart — but the
+Render's free instance has an ephemeral disk, so the SQLite DB resets on restart — but the
 app **re-seeds on every boot**, so the demo users and the pre-shared "Project Roadmap"
 are always present and the sharing flow is always demonstrable; reviewer-created docs
 persist until the next restart. Local runs persist normally via the `./data` volume.

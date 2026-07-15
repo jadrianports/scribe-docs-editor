@@ -6,7 +6,7 @@ viewer / editor roles; export to Markdown or PDF. Built as a focused product sli
 a usable editing flow, a sharing model that is actually enforced, and the
 engineering scaffolding (validation, tests, one-command run, live deploy) around them.
 
-- **Live demo:** `https://<your-app>.koyeb.app` *(paste the Koyeb URL here once deployed)*
+- **Live demo:** `https://<your-app>.onrender.com` *(paste the Render URL here once deployed)*
 - **Run locally:** `docker compose up --build` → **http://localhost:8000**
 - **Log in with:** `alice@example.com` / `demo1234` (two more accounts below)
 
@@ -55,12 +55,12 @@ restarts**. To start completely fresh, delete the `./data/` folder.
 
 ## Live deployment
 
-Scribe is deployed **live on Koyeb** (free tier, no credit card) as a **single Docker
+Scribe is deployed **live on Render** (free tier, no credit card) as a **single Docker
 service** built straight from this repo — FastAPI serves the built SPA *and* the API
 on one port, so there is one thing to deploy and one URL to share. Full step-by-step
 instructions are in **[`DEPLOY.md`](DEPLOY.md)**.
 
-> **Persistence on the live demo (stated honestly):** Koyeb's free instance has an
+> **Persistence on the live demo (stated honestly):** Render's free instance has an
 > ephemeral disk, so the SQLite DB resets on restart/redeploy. The app **re-seeds on
 > every boot**, so the demo users and the pre-shared "Project Roadmap" are always
 > present and the sharing flow is always demonstrable; documents a reviewer creates
@@ -108,7 +108,7 @@ npm run dev                        # Vite dev server on http://localhost:5173
 ```
 
 Open **http://localhost:5173**. The Vite dev server proxies `/api` to the backend on
-port 8000, so both halves work together with hot reload. (In Docker and on Koyeb there
+port 8000, so both halves work together with hot reload. (In Docker and on Render there
 is no proxy — FastAPI serves the pre-built frontend directly on the single port.)
 
 ---
@@ -161,7 +161,7 @@ two real bugs it caught that the unit tests could not).
 - **Autosave is last-write-wins** — no operational-transform / CRDT merge, and no
   real-time collaboration. On a document two editors have open at once, the last save
   wins.
-- **The live Koyeb instance uses a free ephemeral disk** — it re-seeds on boot (see
+- **The live Render instance uses a free ephemeral disk** — it re-seeds on boot (see
   the deployment note above). Local runs persist via the `./data` volume.
 
 ---
@@ -176,7 +176,7 @@ two real bugs it caught that the unit tests could not).
 - Markdown + PDF export
 - Persistence across refresh and restarts (SQLite volume locally)
 - Automated tests (12 backend + 3 frontend), clean `tsc --noEmit`, one-command Docker run
-- **Deployed live on Koyeb** as a single service (see [`DEPLOY.md`](DEPLOY.md))
+- **Deployed live on Render** as a single service (see [`DEPLOY.md`](DEPLOY.md))
 
 **Intentionally deprioritized:**
 - Real-time collaboration, comments, and version history — each is a project in itself.

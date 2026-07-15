@@ -12,10 +12,10 @@ pre-flight checklist is at the bottom; do it before you hit record.
 ## Shot list
 
 ### (0:00) — Intro (~20s)
-- **[ON SCREEN]** The live demo open in a browser at the Koyeb URL (login screen), tab
+- **[ON SCREEN]** The live demo open in a browser at the Render URL (login screen), tab
   visible. Have `docker compose up` running in a terminal you can flash briefly.
 - **[SAY]** "This is Scribe — a rich-text document editor with sharing, export, and
-  file upload. It's **deployed live on Koyeb**, and it also runs locally with a single
+  file upload. It's **deployed live on Render**, and it also runs locally with a single
   command — `docker compose up` on port 8000. Same single Docker image both places:
   FastAPI serves the React app and the API on one port. Let me walk through it."
 
@@ -83,7 +83,7 @@ pre-flight checklist is at the bottom; do it before you hit record.
 
 ## 15-second pre-flight checklist (do this before recording)
 
-- [ ] **Fresh start:** `docker compose up --build` running clean (or the live Koyeb URL
+- [ ] **Fresh start:** `docker compose up --build` running clean (or the live Render URL
       loaded and healthy).
 - [ ] **Browser ready:** pointed at the **live URL** or **http://localhost:8000**,
       **logged out**, cache/other tabs closed.
