@@ -7,15 +7,29 @@ from app.auth import hash_password
 from app.db import get_db
 from app.main import app
 from app.models import Base, User
+from app.routers import collab as collab_router
 
 
 @pytest.fixture()
-def db_session(tmp_path):
+def db_session(tmp_path, monkeypatch):
     engine = create_engine(
         f"sqlite:///{tmp_path / 'test.db'}", connect_args={"check_same_thread": False}
     )
     Base.metadata.create_all(bind=engine)
     TestingSessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    # The collab WS route authorizes by calling `app.db.SessionLocal` directly
+    # (`app/routers/collab.py::_authorize`), not FastAPI's `Depends(get_db)`
+    # that the `client` fixture below overrides -- a websocket connection has
+    # no single per-request DI point the way an HTTP request does. Because
+    # `app/routers/collab.py` does `from ..db import SessionLocal`, that name
+    # was bound into *its own* module namespace at import time; patching
+    # `app.db.SessionLocal` itself would not reach that already-imported
+    # local binding. Redirect the binding actually used
+    # (`app.routers.collab.SessionLocal`) to this test's isolated engine
+    # instead, so a session opened during a WS test sees the same seeded
+    # users/documents as the rest of the test, not the real
+    # backend/data/scribe.db.
+    monkeypatch.setattr(collab_router, "SessionLocal", TestingSessionLocal)
     session = TestingSessionLocal()
     try:
         yield session
