@@ -123,8 +123,8 @@ the single port.)
 
 ## Running the tests
 
-**Backend** — 12 tests covering access control (viewer-vs-editor, non-collaborator
-404-not-403), upload conversion + sanitization, and auth:
+**Backend** — 16 tests covering access control (viewer-vs-editor, non-collaborator
+404-not-403), upload conversion + sanitization, Markdown export, and auth:
 
 ```bash
 cd backend
@@ -184,7 +184,7 @@ two real bugs it caught that the unit tests could not).
 - Access control enforced **server-side** (viewers can't edit; non-collaborators get 404)
 - Markdown + PDF export
 - Persistence across refresh and restarts (SQLite volume locally)
-- Automated tests (12 backend + 3 frontend), clean `tsc --noEmit`, one-command Docker run
+- Automated tests (16 backend + 3 frontend), clean `tsc --noEmit`, one-command Docker run
 - **Deploy-ready** as a single service — one-click Render Blueprint
   ([`render.yaml`](render.yaml) + [`DEPLOY.md`](DEPLOY.md)); delivered local-first (not
   currently hosted)

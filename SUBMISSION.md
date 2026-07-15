@@ -59,7 +59,7 @@ the two grants → log out → sign in as **Bob** (edits the shared doc) → the
 - [x] Access control enforced **server-side** (viewer read-only; non-collaborator 404-not-403)
 - [x] Persistence across refresh and restarts (SQLite)
 - [x] Validation + error handling (typed API errors, friendly UI states)
-- [x] Automated tests (12 backend + 3 frontend), clean `tsc --noEmit`
+- [x] Automated tests (16 backend + 3 frontend), clean `tsc --noEmit`
 - [x] One-command run reviewers can use (`docker compose up`)
 - [x] **Deploy-ready** — one-click Render Blueprint + guide (delivered local-first)
 - [x] Architecture note + AI workflow note

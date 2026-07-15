@@ -99,7 +99,7 @@ AI output is a strong first draft, not a finished answer. Concrete interventions
 
 I did not take "the code looks right" as done. Verification was layered:
 
-1. **Automated tests — 12 backend + 3 frontend, all green**, plus a clean `tsc --noEmit`.
+1. **Automated tests — 16 backend + 3 frontend, all green**, plus a clean `tsc --noEmit`.
    Backend tests hit the real API through FastAPI's TestClient against a temp database and
    assert the access-control matrix (incl. 404-not-403 and viewer-vs-editor) and upload
    sanitization (including that an injected `<script>` is stripped). Frontend tests cover
