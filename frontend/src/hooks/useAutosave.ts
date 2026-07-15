@@ -13,8 +13,16 @@ interface Changes {
  * Debounced autosave for a document. `schedule(changes)` coalesces edits and
  * PATCHes them 800ms after the last change; `flush()` forces an immediate save
  * (also wired to Ctrl/Cmd-S). Saving is a no-op when `enabled` is false (viewers).
+ *
+ * `onSaved` receives the server's updated document after each successful save.
+ * The editor uses it to keep the cached copy fresh, so navigating away and
+ * reopening the document in-session shows the latest content (not a stale cache).
  */
-export function useAutosave(docId: string, enabled: boolean) {
+export function useAutosave(
+  docId: string,
+  enabled: boolean,
+  onSaved?: (doc: DocFull) => void,
+) {
   const [status, setStatus] = useState<SaveStatus>('idle')
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const pending = useRef<Changes>({})
@@ -29,14 +37,15 @@ export function useAutosave(docId: string, enabled: boolean) {
     pending.current = {}
     setStatus('saving')
     try {
-      await api.patch<DocFull>(`/documents/${docId}`, payload)
+      const saved = await api.patch<DocFull>(`/documents/${docId}`, payload)
+      onSaved?.(saved)
       setStatus('saved')
     } catch {
       // Re-queue the failed changes so a later edit / Ctrl-S retries them.
       pending.current = { ...payload, ...pending.current }
       setStatus('error')
     }
-  }, [docId])
+  }, [docId, onSaved])
 
   const schedule = useCallback(
     (changes: Changes) => {

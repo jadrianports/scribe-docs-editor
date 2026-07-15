@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
 import { Link, useParams } from 'react-router-dom'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { EditorContent, useEditor } from '@tiptap/react'
 import StarterKit from '@tiptap/starter-kit'
 import { api } from '../api'
@@ -45,9 +45,20 @@ export function EditorPage() {
 
 function EditorInner({ doc }: { doc: DocFull }) {
   const editable = canEdit(doc.role)
+  const queryClient = useQueryClient()
   const [title, setTitle] = useState(doc.title)
   const [shareOpen, setShareOpen] = useState(false)
-  const { status, schedule, flush } = useAutosave(doc.id, editable)
+
+  // Keep the cached document in sync with each save so that leaving the editor
+  // and reopening it in-session shows the latest content instead of the stale
+  // copy React Query cached when the document was first opened.
+  const onSaved = useCallback(
+    (saved: DocFull) => {
+      queryClient.setQueryData(['document', doc.id], saved)
+    },
+    [queryClient, doc.id],
+  )
+  const { status, schedule, flush } = useAutosave(doc.id, editable, onSaved)
 
   const editor = useEditor({
     editable,
