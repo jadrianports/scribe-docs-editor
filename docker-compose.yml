@@ -1,0 +1,12 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persist the SQLite database on the host so data survives restarts.
+      - ./data:/data
+    environment:
+      # Change this in any real deployment; it signs the session cookie.
+      - SECRET_KEY=local-dev-secret-change-me
+    restart: unless-stopped

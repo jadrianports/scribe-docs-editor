@@ -1,0 +1,20 @@
+# Keep the build context small and never copy host-specific artifacts
+# (a Windows virtualenv or node_modules would break the Linux image).
+**/node_modules
+**/.venv
+**/venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/dist
+**/data
+**/*.db
+**/*.sqlite
+**/*.sqlite3
+.git
+.gitignore
+.dockerignore
+.playwright-mcp
+docs/
+*.md
+.claude/
