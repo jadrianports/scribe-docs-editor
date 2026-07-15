@@ -146,6 +146,16 @@ class RoomManager:
                 room = self._rooms.pop(doc_id)
                 self._counts.pop(doc_id)
                 self._room_tasks.pop(doc_id, None)
+                # Snapshot before stop(): room.ydoc must still be a live,
+                # valid Doc when write_snapshot reads it (Task 7). No actual
+                # import-cycle risk (snapshot.py's own imports -- app.db,
+                # app.models, app.content, .html -- never import rooms.py
+                # back, confirmed by inspection); kept as a local import to
+                # match the brief's given wiring, and it costs nothing since
+                # release() is not a hot path.
+                from .snapshot import write_snapshot
+
+                write_snapshot(doc_id, room.ydoc)
                 await room.stop()
                 return True
             return False

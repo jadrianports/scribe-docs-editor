@@ -4,6 +4,7 @@ from sqlalchemy.orm import sessionmaker
 from starlette.testclient import TestClient
 
 from app.auth import hash_password
+from app.collab import snapshot as collab_snapshot
 from app.db import get_db
 from app.main import app
 from app.models import Base, User
@@ -30,6 +31,20 @@ def db_session(tmp_path, monkeypatch):
     # users/documents as the rest of the test, not the real
     # backend/data/scribe.db.
     monkeypatch.setattr(collab_router, "SessionLocal", TestingSessionLocal)
+    # Same trap, same fix, for Task 7's snapshot writer: `RoomManager.release()`
+    # calls `app.collab.snapshot.write_snapshot()`, which does its own
+    # `from ..db import SessionLocal` + `SessionLocal()` (release() has no
+    # request-scoped session to pass down -- a room emptying isn't a single
+    # DI-scoped HTTP request). Confirmed empirically this isn't just
+    # theoretical: without this redirect, write_snapshot's unpatched
+    # SessionLocal() resolves against the *real* backend/data/scribe.db --
+    # pinned there by SQLAlchemy at engine-creation (import) time, so even
+    # `monkeypatch.chdir(tmp_path)` elsewhere in a test does NOT retarget it
+    # the way it retargets ScribeYStore's relative "data/yjs.db" path. Left
+    # unfixed, a snapshot test would silently query prod, find no matching
+    # doc_id, and no-op -- passing or failing for the wrong reason instead of
+    # exercising the real write path.
+    monkeypatch.setattr(collab_snapshot, "SessionLocal", TestingSessionLocal)
     session = TestingSessionLocal()
     try:
         yield session
