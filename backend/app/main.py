@@ -45,10 +45,16 @@ def health():
 # In dev/tests the dist folder does not exist, so this block is skipped and the
 # API runs on its own (Vite dev server proxies /api during local development).
 if os.path.isdir(FRONTEND_DIST):
+    _DIST_ROOT = os.path.realpath(FRONTEND_DIST)
 
     @app.get("/{full_path:path}")
     def spa(full_path: str):
-        candidate = os.path.join(FRONTEND_DIST, full_path)
-        if full_path and os.path.isfile(candidate):
+        # Serve a real built asset only if the resolved path stays inside the
+        # dist directory; otherwise fall back to index.html for SPA client-side
+        # routing. The containment check prevents path-traversal (e.g. a request
+        # for "../../etc/passwd") from escaping the static root.
+        candidate = os.path.realpath(os.path.join(_DIST_ROOT, full_path))
+        inside_dist = candidate == _DIST_ROOT or candidate.startswith(_DIST_ROOT + os.sep)
+        if full_path and inside_dist and os.path.isfile(candidate):
             return FileResponse(candidate)
-        return FileResponse(os.path.join(FRONTEND_DIST, "index.html"))
+        return FileResponse(os.path.join(_DIST_ROOT, "index.html"))
