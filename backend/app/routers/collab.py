@@ -1,4 +1,5 @@
 import os
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, WebSocket
 from starlette.websockets import WebSocketDisconnect
@@ -14,6 +15,36 @@ router = APIRouter(tags=["collab"])
 _ALLOWED_ORIGINS = set(
     filter(None, os.environ.get("ALLOWED_WS_ORIGINS", "http://localhost:5173,http://localhost:8000").split(","))
 )
+
+
+def _origin_allowed(origin: str | None, host: str | None) -> bool:
+    """True if a WS handshake presenting this `Origin` (browser-sent) against
+    this request's own `Host` header should be allowed to proceed.
+
+    - No `Origin` header at all: allowed, unchanged from before this fix. Only
+      browsers send `Origin` on a WebSocket handshake, so a missing header
+      means a non-browser client (a script, a native app, or this project's
+      own subprocess-driven tests) -- there's nothing to compare it against.
+    - `Origin` is in the explicit `ALLOWED_WS_ORIGINS` allow-list (env var,
+      defaults to the local dev origins): allowed. This is what keeps a
+      split-origin setup working, e.g. the Vite dev server on :5173 talking to
+      the API on :8000, or a separately-hosted frontend in production.
+    - Otherwise: allowed only if the Origin's `host[:port]` equals our own
+      `Host` header, i.e. the request is same-origin. The single-service
+      deploy (SPA and API served from one origin, e.g.
+      `https://scribe-docs-editor.onrender.com`) is *always* same-origin, so
+      this makes collaboration work there with zero configuration. A
+      cross-site attacker's page has an `Origin` equal to *their* site, which
+      never equals our `Host`, so cross-site WS hijacking is still blocked --
+      this doesn't weaken the check, it just recognizes a case (same-origin)
+      that was always safe but previously only allowed via the hardcoded
+      localhost defaults.
+    """
+    if origin is None:
+        return True
+    if origin in _ALLOWED_ORIGINS:
+        return True
+    return urlparse(origin).netloc == host
 
 
 def _authorize(websocket: WebSocket, doc_id: str) -> str | None:
@@ -36,7 +67,7 @@ def _authorize(websocket: WebSocket, doc_id: str) -> str | None:
 async def collab_ws(websocket: WebSocket, doc_id: str):
     # Origin check first: WS bypasses CORS and the cookie rides along.
     origin = websocket.headers.get("origin")
-    if origin is not None and origin not in _ALLOWED_ORIGINS:
+    if not _origin_allowed(origin, websocket.headers.get("host")):
         await websocket.close(code=4403)
         return
 

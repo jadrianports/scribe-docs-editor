@@ -53,3 +53,15 @@ services), or click **Manual Deploy** in the Render dashboard.
 | `PORT` | Port the server binds to | Render injects it; container falls back to `8000` locally |
 | `SECRET_KEY` | Signs the session cookie — Render generates a random value | `dev-secret-change-me` locally |
 | `DATABASE_URL` | SQLAlchemy URL | `sqlite:////data/scribe.db` |
+| `ALLOWED_WS_ORIGINS` | Extra allow-listed origins for the collaboration WebSocket (comma-separated) | `http://localhost:5173,http://localhost:8000` |
+
+## Real-time collaboration and this deploy
+
+**Works out of the box, no configuration needed.** The collaboration WebSocket
+(`/api/collab/{doc_id}`) accepts a request whenever its `Origin` is **same-origin**
+with the request's own `Host` header — and this single-service deploy is always
+same-origin, since Render serves the SPA and the API from the one
+`https://<name>.onrender.com` URL. `ALLOWED_WS_ORIGINS` above only matters if you
+split the frontend and backend across two different origins (e.g. hosting the SPA
+somewhere else and pointing it at this API) — add that other origin to the list in
+that case. You do not need to set it for the Blueprint deploy described above.

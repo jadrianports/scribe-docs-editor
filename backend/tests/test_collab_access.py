@@ -65,6 +65,85 @@ def test_owner_can_connect(client, a_doc, login):
         assert ws.receive_bytes()  # server sends initial SYNC_STEP1
 
 
+# --- Task 10: same-origin-aware origin check (deploy-origin fix) ---
+#
+# `routers/collab.py::_origin_allowed` fails CLOSED by default -- a mismatched
+# Origin is rejected -- so the risk this fix guards against isn't "opens up a
+# hole," it's "collaboration silently never works on the single-service Render
+# deploy" (SPA + API share one origin there, which never matches the hardcoded
+# ALLOWED_WS_ORIGINS localhost defaults). Each test below drives the real route
+# through `TestClient.websocket_connect` with a spoofed `Origin`/`Host` header
+# pair -- exactly what the brief asked for -- rather than unit-testing
+# `_origin_allowed` in isolation, so this proves the check is actually wired
+# into `collab_ws` and runs before `_authorize()`, not just that the helper
+# function's logic is correct on its own.
+#
+# All four log in as alice (the doc's owner) so a rejection can only be
+# attributed to the origin check, never to authorization; the cross-origin
+# case additionally asserts the specific 4403 close code, distinguishing
+# "origin check rejected me" from any other reason a socket might close.
+
+
+def test_same_origin_is_allowed(client, a_doc, login):
+    """Origin's host:port equals the Host header -- the shape every request
+    has on the single-service deploy, where the SPA and the API are served
+    from one origin (e.g. https://scribe-docs-editor.onrender.com). Allowed
+    even though "example.onrender.com" is nowhere in ALLOWED_WS_ORIGINS --
+    same-origin is what makes this pass, not an allow-list entry.
+    """
+    login("alice@example.com")
+    with client.websocket_connect(
+        f"/api/collab/{a_doc.id}",
+        headers={"origin": "https://example.onrender.com", "host": "example.onrender.com"},
+    ) as ws:
+        assert ws.receive_bytes()  # SYNC_STEP1 -- connection was accepted
+
+
+def test_cross_origin_is_rejected(client, a_doc, login):
+    """Origin host != Host header -- a cross-site page (e.g. an attacker's
+    evil.com) trying to open a WebSocket against our origin using a victim's
+    browser (which sends OUR cookies but THEIR page's Origin). Rejected with
+    4403 even for alice, who owns the document -- proving the origin check
+    runs, and blocks, before authorization is ever considered.
+    """
+    login("alice@example.com")
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with client.websocket_connect(
+            f"/api/collab/{a_doc.id}",
+            headers={"origin": "https://evil.com", "host": "example.onrender.com"},
+        ) as ws:
+            ws.receive_bytes()
+    assert exc_info.value.code == 4403
+
+
+def test_explicit_allow_listed_origin_is_allowed(client, a_doc, login):
+    """An Origin in ALLOWED_WS_ORIGINS (the dev default here includes
+    http://localhost:5173) is allowed even when it doesn't match Host at all
+    -- this is what keeps a split-origin setup (the Vite dev server on :5173
+    talking to the API on :8000) working, unchanged from before this fix.
+    """
+    login("alice@example.com")
+    with client.websocket_connect(
+        f"/api/collab/{a_doc.id}",
+        headers={"origin": "http://localhost:5173", "host": "example.onrender.com"},
+    ) as ws:
+        assert ws.receive_bytes()
+
+
+def test_missing_origin_is_allowed(client, a_doc, login):
+    """No Origin header at all (any non-browser client) is allowed through
+    unconditionally, unchanged from before this fix -- there's nothing to
+    compare it against. The explicit origin-focused counterpart to
+    `test_owner_can_connect` above (which exists to prove auth succeeds, not
+    specifically to document the origin check's behavior on a missing header).
+    """
+    login("alice@example.com")
+    with client.websocket_connect(
+        f"/api/collab/{a_doc.id}", headers={"host": "example.onrender.com"}
+    ) as ws:
+        assert ws.receive_bytes()
+
+
 # --- Task 9: end-to-end proof that ReadOnlyChannel enforces server-side ---
 #
 # Everything above this point uses Starlette's `TestClient`, which is fine
