@@ -4,7 +4,6 @@ import { useAuth } from './auth/AuthContext'
 import { LoginPage } from './pages/LoginPage'
 import { DashboardPage } from './pages/DashboardPage'
 import { EditorPage } from './pages/EditorPage'
-import { CollabSpike } from './spike/CollabSpike'
 
 function FullScreenMessage({ children }: { children: ReactNode }) {
   return (
@@ -23,8 +22,6 @@ export function App() {
   return (
     <Routes>
       <Route path="/login" element={<LoginPage />} />
-      {/* Phase-0 spike: real-time collaboration proof, deleted in Phase 1 (Task 5). */}
-      <Route path="/spike" element={<CollabSpike />} />
       <Route
         path="/"
         element={

@@ -47,6 +47,34 @@
   color: #475569;
 }
 
+/* --- Collaboration carets (@tiptap/extension-collaboration-caret) ---
+   The extension renders `.collaboration-carets__caret` / `__label` elements
+   with an inline border/background color per remote user but ships no
+   layout CSS of its own -- without this the label would render as an
+   unstyled block-level div. Minimal styling only; presence polish (colors,
+   avatars, name list) is a later task. */
+.collaboration-carets__caret {
+  position: relative;
+  margin-left: -1px;
+  margin-right: -1px;
+  border-left: 1px solid;
+  border-right: 1px solid;
+  word-break: normal;
+  pointer-events: none;
+}
+.collaboration-carets__label {
+  position: absolute;
+  top: -1.4em;
+  left: -1px;
+  white-space: nowrap;
+  border-radius: 3px 3px 3px 0;
+  padding: 0.1rem 0.4rem;
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: #fff;
+  user-select: none;
+}
+
 /* --- Print stylesheet for "Export to PDF" ---
    Hide everything except the document area so the browser's Save-as-PDF captures
    just the document (title + body). */

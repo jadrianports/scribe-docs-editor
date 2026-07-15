@@ -4,16 +4,21 @@ import { Link, useParams } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { EditorContent, useEditor } from '@tiptap/react'
 import StarterKit from '@tiptap/starter-kit'
+import Collaboration from '@tiptap/extension-collaboration'
+import CollaborationCaret from '@tiptap/extension-collaboration-caret'
 import { api } from '../api'
-import type { DocFull } from '../api'
+import type { DocFull, User } from '../api'
 import { canEdit, isOwner, roleBadge } from '../lib/permissions'
 import { useAutosave } from '../hooks/useAutosave'
 import type { SaveStatus } from '../hooks/useAutosave'
+import { useCollab } from '../hooks/useCollab'
+import type { CollabConnection, CollabStatus } from '../hooks/useCollab'
+import { useAuth } from '../auth/AuthContext'
 import { Toolbar } from '../components/Toolbar'
 import { ShareModal } from '../components/ShareModal'
 import { ExportMenu } from '../components/ExportMenu'
 
-function statusLabel(status: SaveStatus): string {
+function titleStatusLabel(status: SaveStatus): string {
   switch (status) {
     case 'saving':
       return 'Saving…'
@@ -24,6 +29,20 @@ function statusLabel(status: SaveStatus): string {
     default:
       return ''
   }
+}
+
+function collabStatusLabel(status: CollabStatus): string {
+  return status === 'connected' ? 'Live' : 'Reconnecting…'
+}
+
+// Deterministic per-user caret color. Stepping the hue by the golden angle
+// (~137.508°) per user id spreads consecutive ids around the color wheel so
+// a handful of concurrent collaborators rarely land on visually similar
+// colors, without needing a server-assigned palette. Good enough for now —
+// presence polish is a later task.
+function caretColor(userId: number): string {
+  const hue = Math.round((userId * 137.508) % 360)
+  return `hsl(${hue}, 70%, 45%)`
 }
 
 export function EditorPage() {
@@ -46,11 +65,12 @@ export function EditorPage() {
 function EditorInner({ doc }: { doc: DocFull }) {
   const editable = canEdit(doc.role)
   const queryClient = useQueryClient()
+  const { user } = useAuth()
   const [title, setTitle] = useState(doc.title)
   const [shareOpen, setShareOpen] = useState(false)
 
   // Keep the cached document in sync with each save so that leaving the editor
-  // and reopening it in-session shows the latest content instead of the stale
+  // and reopening it in-session shows the latest title instead of the stale
   // copy React Query cached when the document was first opened.
   const onSaved = useCallback(
     (saved: DocFull) => {
@@ -59,24 +79,9 @@ function EditorInner({ doc }: { doc: DocFull }) {
     [queryClient, doc.id],
   )
   const { status, schedule, flush } = useAutosave(doc.id, editable, onSaved)
+  const { conn, status: collabStatus } = useCollab(doc.id)
 
-  const editor = useEditor({
-    editable,
-    extensions: [
-      StarterKit.configure({
-        heading: { levels: [1, 2, 3] },
-        // Keep the editor schema aligned with the server's sanitizer allow-list.
-        link: false,
-        code: false,
-        codeBlock: false,
-        horizontalRule: false,
-      }),
-    ],
-    content: doc.content_html || '<p></p>',
-    onUpdate: ({ editor }) => schedule({ content_html: editor.getHTML() }),
-  })
-
-  // Flush any pending changes when navigating away from the editor.
+  // Flush any pending title changes when navigating away from the editor.
   useEffect(() => () => void flush(), [flush])
 
   return (
@@ -95,7 +100,10 @@ function EditorInner({ doc }: { doc: DocFull }) {
           aria-label="Document title"
           className="min-w-0 flex-1 rounded px-2 py-1 text-lg font-semibold text-slate-800 outline-none focus:bg-slate-100 disabled:bg-transparent"
         />
-        <span className="hidden text-xs text-slate-400 sm:inline">{statusLabel(status)}</span>
+        <span className="hidden text-xs text-slate-400 sm:inline">
+          {collabStatusLabel(collabStatus)}
+        </span>
+        <span className="hidden text-xs text-slate-400 sm:inline">{titleStatusLabel(status)}</span>
         {!editable && (
           <span className="rounded bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800">
             {roleBadge(doc.role)}
@@ -112,17 +120,118 @@ function EditorInner({ doc }: { doc: DocFull }) {
         )}
       </header>
 
-      {editor && editable && <Toolbar editor={editor} />}
+      {conn ? (
+        <CollaborativeEditor
+          key={conn.doc.guid}
+          conn={conn}
+          contentHtml={doc.content_html}
+          editable={editable}
+          title={title}
+          user={user}
+        />
+      ) : (
+        <main className="mx-auto my-6 max-w-3xl px-4">
+          <article className="document-print rounded-lg bg-white p-8 shadow-sm sm:p-12">
+            <p className="text-sm text-slate-400">Connecting…</p>
+          </article>
+        </main>
+      )}
 
+      {shareOpen && <ShareModal docId={doc.id} onClose={() => setShareOpen(false)} />}
+    </div>
+  )
+}
+
+/**
+ * Owns the actual TipTap editor instance, created only once a live collab
+ * connection exists. The caller keys this component on `conn.doc.guid`, so
+ * React StrictMode's dev-only extra mount->cleanup->mount of `useCollab`
+ * (which replaces `conn` with a fresh Y.Doc/provider pair) tears this whole
+ * subtree down and rebuilds it against the new, live connection instead of
+ * reusing an editor bound to an already-destroyed Y.Doc.
+ */
+function CollaborativeEditor({
+  conn,
+  contentHtml,
+  editable,
+  title,
+  user,
+}: {
+  conn: CollabConnection
+  contentHtml: string
+  editable: boolean
+  title: string
+  user: User | null
+}) {
+  const { doc: ydoc, provider } = conn
+
+  const editor = useEditor({
+    editable,
+    extensions: [
+      StarterKit.configure({
+        heading: { levels: [1, 2, 3] },
+        // Keep the editor schema aligned with the server's sanitizer allow-list.
+        link: false,
+        code: false,
+        codeBlock: false,
+        horizontalRule: false,
+        undoRedo: false, // Collaboration extension provides Yjs-based (per-user) undo instead.
+      }),
+      Collaboration.configure({ document: ydoc }),
+      CollaborationCaret.configure({
+        provider,
+        user: { name: user?.name ?? 'Anonymous', color: caretColor(user?.id ?? 0) },
+      }),
+    ],
+    // No `content:` -- the document body comes from the shared Y.Doc, not
+    // from `content_html` directly (that's only used once, below, to seed a
+    // document that has never been opened for collaboration before).
+  })
+
+  // Seed the shared doc once from the document's last-saved HTML. Guarded so
+  // that N clients opening the same never-collaborated-on document don't
+  // each insert their own copy: `doc.getMap('config')` is itself part of the
+  // synced CRDT state, so once the first client to observe "synced but not
+  // yet seeded" flips the flag, that update propagates to every other
+  // client and none of them re-run `setContent`.
+  //
+  // Listens for the (correctly-typed) 'sync' event -- the runtime also
+  // emits an identically-timed 'synced' event, but the installed type
+  // definitions only declare 'sync', so 'synced' fails `tsc --noEmit`.
+  // Also checks `provider.synced` directly, both immediately after
+  // subscribing (the event is edge-triggered -- only fires on a state
+  // *transition* -- so a listener that subscribes after the handshake
+  // already completed would otherwise miss it forever) and inside the
+  // handler itself (the same event also fires on false->true *and*
+  // true->false, e.g. a disconnect; re-checking the live getter rather than
+  // trusting "the event fired" keeps a disconnect from being treated as a
+  // sync).
+  useEffect(() => {
+    const trySeed = () => {
+      if (!provider.synced) return
+      const config = ydoc.getMap('config')
+      if (!config.get('seeded') && editor && contentHtml) {
+        config.set('seeded', true)
+        editor.commands.setContent(contentHtml)
+      }
+    }
+    provider.on('sync', trySeed)
+    trySeed()
+    return () => {
+      provider.off('sync', trySeed)
+    }
+  }, [provider, ydoc, editor, contentHtml])
+
+  return (
+    <>
+      {editor && editable && <Toolbar editor={editor} />}
       <main className="mx-auto my-6 max-w-3xl px-4">
         <article className="document-print rounded-lg bg-white p-8 shadow-sm sm:p-12">
           <h1 className="mb-6 hidden text-3xl font-bold print:block">{title}</h1>
           <EditorContent editor={editor} />
         </article>
       </main>
-
-      {shareOpen && <ShareModal docId={doc.id} onClose={() => setShareOpen(false)} />}
-    </div>
+    </>
   )
 }
 
