@@ -19,7 +19,13 @@ def export_document(format: str = "md", acc: DocAccess = Depends(require_reader)
     if format != "md":
         # PDF is produced client-side (print-to-PDF); only Markdown is served here.
         raise HTTPException(status_code=400, detail="Only 'md' export is supported by the API")
-    body = f"# {acc.document.title}\n\n" + html_to_markdown(acc.document.content_html)
+    # Export the document content as-is. Documents usually lead with their own
+    # heading, so we do NOT prepend the title (that produced a duplicated title
+    # for heading-led docs). Empty documents fall back to a title heading, and the
+    # filename always carries the title.
+    body = html_to_markdown(acc.document.content_html).strip()
+    if not body:
+        body = f"# {acc.document.title}"
     filename = _safe_filename(acc.document.title) + ".md"
     return Response(
         content=body,
