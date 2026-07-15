@@ -6,7 +6,7 @@ from fastapi.responses import FileResponse
 from starlette.middleware.sessions import SessionMiddleware
 
 from .db import SessionLocal, init_db
-from .routers import auth, documents, export, shares, upload
+from .routers import auth, collab, documents, export, shares, upload
 from .seed import seed
 
 SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-change-me")
@@ -34,6 +34,7 @@ app.include_router(documents.router, prefix="/api")
 app.include_router(shares.router, prefix="/api")
 app.include_router(upload.router, prefix="/api")
 app.include_router(export.router, prefix="/api")
+app.include_router(collab.router, prefix="/api")
 
 
 @app.get("/api/health")
