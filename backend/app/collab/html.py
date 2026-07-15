@@ -42,6 +42,42 @@ Two consequences that would otherwise silently drop every mark:
     across an encode/decode round-trip of the same content in-process), so
     multi-mark nesting order on one run is driven by our own fixed
     `_MARK_ORDER`, never by iterating the attrs dict itself.
+
+Sanitizer-stability for out-of-schema trees
+--------------------------------------------
+The WS channel forwards raw Yjs update bytes with no ProseMirror-schema
+validation, so the fragment can contain shapes a TipTap client would never
+produce -- e.g. a block node (mapped or unmapped) nested inside a
+`paragraph`/`heading`. A uniform recursive walk that always nests a child's
+rendered HTML inside its parent's wrapper tag breaks stability for exactly
+that case: `<p>`/`<hN>` have a phrasing-content-only model, and bleach's
+HTML parser (html5lib) enforces part of that at parse time by auto-closing
+an open `<p>` (or heading, on a *nested heading* start tag specifically --
+verified empirically that a heading otherwise tolerates non-heading block
+content nested inside it) as soon as it meets a nested block-starting tag.
+So e.g. `<p>before <p>@bob</p> after</p>` (an unmapped node, which falls
+back to `<p>`, misplaced inside a paragraph) re-parses+serializes to
+`<p>before </p><p>@bob</p> after<p></p>` -- different from the input.
+
+Fix: `_element_html` resolves each element's own output tag first, and if
+that tag is phrasing-content-only (`p`/`h1`/`h2`/`h3` -- `_PHRASING_ONLY_
+TAGS`), its children are rendered by `_wrapped_inline_html`, which walks
+them looking for anything that isn't inline-safe (plain text or a
+`hardBreak`). Inline-safe content is buffered and wrapped normally; a
+block-shaped child is never nested inside the wrapper -- it's hoisted out
+as its own sibling, splitting the buffered inline content into multiple
+same-tag wrappers around it (`<p>before </p><p>@bob</p><p> after</p>`)
+instead. This keys off the *resolved output tag*, not the source node's
+own tag name, so it uniformly covers mapped blocks (`bulletList` -> `ul`),
+unmapped nodes (fall back to `p`), and nested headings alike, at any
+recursion depth -- verified against bleach directly for every shape this
+produces (see `backend/tests/test_collab_html.py`).
+
+Every other wrapper (`blockquote`, `li`, `ul`, `ol`, and the fragment root
+itself) has a flow-content model that tolerates nested block content
+without the parser restructuring it (also verified directly against
+bleach), so their children keep the original simple concatenation --
+no hoisting needed there.
 """
 
 import html as html_lib
@@ -50,10 +86,19 @@ from pycrdt import Doc, XmlElement, XmlFragment, XmlText
 
 # ProseMirror heading level -> HTML tag. Only 1-3 are in the editor schema
 # (frontend caps `StarterKit.configure({ heading: { levels: [1, 2, 3] } })`)
-# and content.ALLOWED_TAGS only allows h1-h3; an out-of-range level falls
-# back to h1 rather than emit a tag sanitize_html would strip (which would
-# silently unwrap the heading's text instead of just clamping its level).
+# and content.ALLOWED_TAGS only allows h1-h3; an out-of-range OR non-numeric
+# OR missing/None level all fall back to h1 (`_heading_level` returns None
+# for anything `int()` can't parse, and `.get(None, "h1")` below misses the
+# dict same as an out-of-range int does) rather than emit a tag
+# sanitize_html would strip (which would silently unwrap the heading's text
+# instead of just clamping its level) or raise out of ydoc_to_html entirely.
 _HEADING_TAGS = {1: "h1", 2: "h2", 3: "h3"}
+
+# Output tags with a phrasing-content-only model: nesting a block-shaped
+# child inside one of these is the specific shape bleach's HTML parser
+# restructures on sanitization. See the module docstring's
+# "Sanitizer-stability for out-of-schema trees" section.
+_PHRASING_ONLY_TAGS = {"p", "h1", "h2", "h3"}
 
 # ProseMirror block node name -> HTML tag, aligned with content.ALLOWED_TAGS.
 # `heading` and `hardBreak` are handled separately (level lookup / void tag).
@@ -107,12 +152,72 @@ def _run_html(text: object, attrs: dict | None) -> str:
 
 
 def _element_html(node: XmlElement) -> str:
-    inner = "".join(_node_html(child) for child in node.children)
-    if node.tag == "heading":
-        level = int(dict(node.attributes).get("level", 1))
-        tag = _HEADING_TAGS.get(level, "h1")
-        return f"<{tag}>{inner}</{tag}>"
     if node.tag == "hardBreak":
         return "<br>"
-    tag = _BLOCK_TAGS.get(node.tag, "p")
+    if node.tag == "heading":
+        tag = _HEADING_TAGS.get(_heading_level(node), "h1")
+    else:
+        tag = _BLOCK_TAGS.get(node.tag, "p")
+    if tag in _PHRASING_ONLY_TAGS:
+        return _wrapped_inline_html(node.children, tag)
+    inner = "".join(_node_html(child) for child in node.children)
     return f"<{tag}>{inner}</{tag}>"
+
+
+def _heading_level(node: XmlElement) -> int | None:
+    """Parsed `level` attribute, or None if it's missing, non-numeric, or
+    otherwise un-parseable. Never raises: the WS channel forwards raw Yjs
+    bytes with no ProseMirror-schema validation, so `level` can be any
+    JSON-compatible value a client writes (a string, None, ...), and
+    Task 7 calls ydoc_to_html to build snapshots -- a crash here must never
+    propagate. Callers look up the result in `_HEADING_TAGS`, which falls
+    back to h1 for None same as it does for an out-of-range int.
+    """
+    raw = dict(node.attributes).get("level", 1)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_inline_safe(node: object) -> bool:
+    """True if `node` can be nested directly inside a <p>/<hN> wrapper
+    without landing inside the one shape bleach's HTML parser restructures
+    on sanitization. Only plain text and `hardBreak` render as inline/void
+    output; every other element renders as a block tag (see module
+    docstring) and must not be nested in a phrasing-only wrapper.
+    """
+    if isinstance(node, XmlText):
+        return True
+    return isinstance(node, XmlElement) and node.tag == "hardBreak"
+
+
+def _wrapped_inline_html(children, tag: str) -> str:
+    """Render `children` as the content of a <tag>...</tag> wrapper (`tag`
+    is always one of `_PHRASING_ONLY_TAGS`), hoisting any block-shaped
+    child out as its own top-level sibling instead of nesting it inside
+    `tag` -- see the module docstring's "Sanitizer-stability for
+    out-of-schema trees" section for why that nesting must never happen.
+
+    Buffered inline content is split into multiple `<tag>...</tag>` runs
+    around each hoisted block, e.g. a paragraph containing
+    text/block/text renders as `<p>text</p>{block}<p>text</p>` rather than
+    `<p>text{block}text</p>`. A run is only emitted if it has content, or
+    if there were no block children at all (preserving a single empty
+    `<tag></tag>` for a genuinely childless paragraph/heading).
+    """
+    pieces: list[str] = []
+    buffer = ""
+    saw_block = False
+    for child in children:
+        if _is_inline_safe(child):
+            buffer += _node_html(child)
+            continue
+        saw_block = True
+        if buffer:
+            pieces.append(f"<{tag}>{buffer}</{tag}>")
+            buffer = ""
+        pieces.append(_node_html(child))
+    if buffer or not saw_block:
+        pieces.append(f"<{tag}>{buffer}</{tag}>")
+    return "".join(pieces)
