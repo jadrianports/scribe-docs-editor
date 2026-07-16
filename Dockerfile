@@ -13,6 +13,7 @@ FROM python:3.12-slim AS runtime
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     DATABASE_URL=sqlite:////data/scribe.db \
+    SCRIBE_DATA_DIR=/data \
     SECRET_KEY=change-me-in-production
 WORKDIR /app
 COPY backend/requirements.txt ./backend/requirements.txt
