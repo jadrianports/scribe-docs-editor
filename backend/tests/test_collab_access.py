@@ -1,4 +1,5 @@
 import gc
+import os
 import socket
 import subprocess
 import sys
@@ -200,28 +201,50 @@ def _wait_until_healthy(proc: subprocess.Popen, port: int, log_path: Path, timeo
 
 @pytest.fixture()
 def live_server(tmp_path):
-    """A real `uvicorn app.main:app` subprocess against the REAL seeded dev
-    DB (`backend/data/scribe.db` + `backend/data/yjs.db`), deliberately NOT
-    a throwaway per-test DB: proving that `ReadOnlyChannel` enforces for an
-    actual viewer needs the real seeded relationship from `app/seed.py`
-    (carol is a *viewer* and bob is an *editor* on alice's "Project
-    Roadmap") -- a fresh empty DB has no such relationship to test against.
-    Launched with cwd=backend and no DATABASE_URL override, so it resolves
-    the same relative "./data/scribe.db" / "data/yjs.db" paths the real dev
-    server uses.
+    """A real `uvicorn app.main:app` subprocess, isolated to a throwaway
+    per-test SQLite database -- never `backend/data/scribe.db` /
+    `backend/data/yjs.db`.
 
-    Safe for a repeatedly-run dev DB: the lifespan's `seed()` is a no-op
-    once users already exist, so this never re-seeds or duplicates data, and
-    the test using this fixture only ever mutates a scratch Yjs root key
-    that `ydoc_to_html` (and therefore the room-empty HTML snapshot) never
-    reads -- see that test's docstring for the full argument.
+    Before this fix, this fixture deliberately ran against the REAL dev DB:
+    proving `ReadOnlyChannel` enforces for an actual viewer needs the real
+    seeded relationship from `app/seed.py` (carol is a *viewer* and bob is
+    an *editor* on alice's "Project Roadmap"), and a fresh empty DB seemed
+    to have no such relationship to test against. That reasoning missed that
+    `seed()` (below) recreates the identical relationship on ANY empty DB --
+    and running a subprocess against real dev data is also just unsafe on
+    its own terms: `conftest.py`'s `SessionLocal` monkeypatch, which
+    isolates every other test in this file, only rebinds the name inside
+    *this* test process and can never reach a separate subprocess. Combined
+    with the (now-fixed) CRITICAL snapshot-on-empty bug
+    (`app.collab.snapshot.write_snapshot`), a plain `pytest` run could
+    silently mutate/wipe the real seeded "Project Roadmap" document.
+
+    `DATABASE_URL` and `SCRIBE_DATA_DIR` are set in the SUBPROCESS's own
+    environment (not this test process's) to absolute paths under
+    `tmp_path`, so both `scribe.db` (`app.db`) and `yjs.db`
+    (`app.collab.ystore.ScribeYStore`, see its FIX 2/3 docstring) resolve
+    there regardless of the subprocess's cwd -- `cwd=BACKEND_DIR` below is
+    kept only so `-m uvicorn app.main:app` still resolves the `app` package.
+    The lifespan's `seed()` still runs on startup exactly as it does against
+    the real dev DB; it is idempotent on any DB with no users yet
+    (`backend/app/seed.py`), so this fresh tmp DB gets the identical
+    alice/bob/carol + "Project Roadmap" (bob=editor, carol=viewer) fixture
+    the tests below need, with no register endpoint or hand-rolled seeding
+    required here -- and, being fresh per test, never accumulates state
+    across runs either.
     """
     port = _free_port()
     log_path = tmp_path / "uvicorn.log"
     log_file = open(log_path, "wb")
+    env = {
+        **os.environ,
+        "DATABASE_URL": f"sqlite:///{tmp_path / 'scribe.db'}",
+        "SCRIBE_DATA_DIR": str(tmp_path),
+    }
     proc = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", str(port)],
         cwd=BACKEND_DIR,
+        env=env,
         stdout=log_file,
         stderr=subprocess.STDOUT,
     )
@@ -315,20 +338,22 @@ def test_viewer_edit_is_dropped_editor_edit_is_applied(live_server):
     proving the negative result above is because of the role, not because
     the whole plumbing is silently broken.
 
-    Runs against the real seeded dev DB (see `live_server`'s docstring for
-    why) but only ever touches a scratch `Text` root
+    Runs against `live_server`'s isolated, freshly-seeded per-test database
+    (see its docstring) but only ever touches a scratch `Text` root
     ("collab-test-<uuid4>") that `ydoc_to_html` never reads (it only ever
     walks the "default" `XmlFragment` -- see app/collab/html.py's module
     docstring) -- so this can never change the Roadmap document's actual
     content or its HTML snapshot. Each run also uses a fresh uuid4 root name
     and fresh uuid4-suffixed marker text, so assertions never depend on
     (accumulated) state left behind by a previous run. Connecting to and
-    disconnecting from a real, pre-existing document's room still triggers
-    RoomManager.release()'s unconditional snapshot write once the room
-    empties (harmless here since "default" is never touched -- content_html
-    is simply re-derived to the same value it already had -- but it does
-    bump that document's `updated_at`, same as any other collaborator
-    briefly connecting would).
+    disconnecting from the Roadmap document's room still triggers
+    RoomManager.release()'s snapshot consideration once the room empties,
+    but this fixture's fresh tmp yjs.db means that room's Y.Doc was never
+    *seeded* (no TipTap client -- this test only ever speaks raw pycrdt --
+    ever ran EditorPage.tsx's seed effect), so `write_snapshot`'s seeded
+    guard (`app.collab.snapshot`, the final-review CRITICAL fix) skips the
+    write entirely: neither `content_html` nor `updated_at` changes as a
+    side effect of this test.
     """
 
     async def scenario() -> None:
@@ -412,8 +437,11 @@ def test_concurrent_editor_inserts_at_same_position_both_survive_merged(live_ser
     made it cheap and low-risk to add on top, not because it was required.
 
     Same scratch-root-key / unique-marker approach as the viewer test above
-    (see its docstring) to stay clear of the real "default" document content
-    and stay safe to run repeatedly against the real seeded dev DB.
+    (see its docstring) to stay clear of the real "default" document
+    content -- kept even though `live_server` now gives each run its own
+    fresh, isolated database (so there is no accumulated state to begin
+    with) for consistency with that test and as defense-in-depth against
+    ever pointing this fixture at a shared database again.
     """
 
     async def scenario() -> None:
