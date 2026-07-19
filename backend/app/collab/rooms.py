@@ -20,6 +20,11 @@ log = logging.getLogger(__name__)
 # seconds," not forever (Task 3 review, "Important" finding).
 DEFAULT_STARTUP_TIMEOUT = 5.0
 
+# Bounds release()'s final, already-dirty snapshot persist -- kept separate
+# from DEFAULT_STARTUP_TIMEOUT above: 5s of teardown stall reads to a
+# reconnecting peer as unresponsive, so this is a tighter bound (D-10).
+RELEASE_SNAPSHOT_TIMEOUT = 2.0
+
 
 @dataclass
 class RoomRecord:
@@ -239,26 +244,46 @@ class RoomManager:
             if rec.count <= 0:
                 room = rec.room
                 self._rooms_by_id.pop(doc_id)
-                # Snapshot before stop(): room.ydoc must still be a live,
-                # valid Doc when write_snapshot reads it (Task 7). No actual
-                # import-cycle risk (snapshot.py's own imports -- app.db,
-                # app.models, app.content, .html -- never import rooms.py
-                # back, confirmed by inspection); kept as a local import to
-                # match the brief's given wiring, and it costs nothing since
-                # release() is not a hot path.
-                from .snapshot import write_snapshot
 
-                # A failing snapshot (e.g. a locked DB) must never skip
-                # room.stop() below: doc_id was already popped from
+                # Cancel the ticker and await its cancellation BEFORE deriving
+                # the final snapshot below (D-13): this guarantees exactly one
+                # writer ever runs at teardown -- a stale in-flight tick can
+                # never land after (or race) this final write. Unobserving
+                # the dirty subscription here is discretionary hygiene (A2):
+                # `room.ydoc` and `record` are both about to be dropped, so
+                # it's GC-safe either way, but it costs nothing to be tidy.
+                if rec.ticker_task is not None:
+                    rec.ticker_task.cancel()
+                    try:
+                        await rec.ticker_task
+                    except asyncio.CancelledError:
+                        pass
+                if rec.dirty_subscription is not None:
+                    room.ydoc.unobserve(rec.dirty_subscription)
+
+                # Only derive+persist a snapshot if an edit landed since the
+                # last successful write (D-12) -- room.ydoc must still be a
+                # live, valid Doc when derive_snapshot_html reads it, so this
+                # runs before room.stop() below. A failing/timed-out snapshot
+                # must never skip room.stop(): doc_id was already popped from
                 # self._rooms_by_id above (evicted), so nothing would ever
-                # call stop() on THIS room again -- its task group, its
-                # ydoc.observe() subscription, and its YStore connection
-                # would all leak for the life of the process. Log-and-continue,
-                # same pattern as _make_crash_evictor above.
-                try:
-                    write_snapshot(doc_id, room.ydoc)
-                except Exception:
-                    log.error("failed to write snapshot for doc %r", doc_id, exc_info=True)
+                # call stop() on THIS room again -- its task group and its
+                # YStore connection would leak for the life of the process.
+                # Log-and-continue, same pattern as _make_crash_evictor above;
+                # the persist half never has its worker thread cancelled
+                # (asyncio.to_thread cannot interrupt a blocking commit --
+                # only the await is bounded, not the underlying write).
+                if rec.dirty:
+                    try:
+                        html = snapshot.derive_snapshot_html(room.ydoc)
+                        if html is not None:
+                            with fail_after(RELEASE_SNAPSHOT_TIMEOUT):
+                                await asyncio.to_thread(snapshot.persist_snapshot_html, doc_id, html)
+                    except TimeoutError:
+                        log.error("snapshot persist timed out for doc %r", doc_id)
+                    except Exception:
+                        log.error("failed to write snapshot for doc %r", doc_id, exc_info=True)
+
                 await room.stop()
                 return True
             return False
