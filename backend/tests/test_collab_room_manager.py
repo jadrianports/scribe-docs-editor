@@ -214,21 +214,38 @@ def test_release_stops_and_evicts_room_even_if_snapshot_write_fails(tmp_path, mo
     what `YRoom.stop()` leaves behind (confirmed by reading its source), so
     it directly distinguishes "stopped" from merely "evicted from the
     manager's dict but still running in the background."
+
+    Retargeted (plan 06-04, D-24/D-25): release() no longer calls
+    write_snapshot directly -- plan 03 split it into derive_snapshot_html
+    (event-loop thread) + persist_snapshot_html (worker thread) -- so the
+    failure injection point moves to persist_snapshot_html. Unlike the old
+    unconditional write_snapshot(doc_id, ydoc) call this used to intercept,
+    persist only runs when the room is both seeded and dirty, so this test
+    now seeds+edits the room first to actually exercise that path. The two
+    other REQ-snapshot-recovery-tests modes (network disconnect during
+    autosave; WS reconnect with pending title change) are frontend paths
+    handed to Phase 9's criterion 4, not this phase (D-24).
     """
     monkeypatch.chdir(tmp_path)
 
     from app.collab import snapshot as collab_snapshot
 
-    def raising_write_snapshot(doc_id, ydoc):
+    def raising_persist(doc_id, html):
         raise RuntimeError("boom: simulated locked DB")
 
-    monkeypatch.setattr(collab_snapshot, "write_snapshot", raising_write_snapshot)
+    monkeypatch.setattr(collab_snapshot, "persist_snapshot_html", raising_persist)
 
     async def scenario():
         mgr = RoomManager()
 
         with anyio.fail_after(5):
             room = await mgr.get("doc-snapshot-fail")
+
+        room.ydoc.get("config", type=Map)["seeded"] = True  # so release() reaches persist
+        frag = room.ydoc.get("default", type=XmlFragment)
+        para = XmlElement("paragraph")
+        frag.children.append(para)
+        para.children.append(XmlText("edited"))
 
         # Must not raise: the old code let write_snapshot's RuntimeError
         # propagate straight out of release().
@@ -317,3 +334,53 @@ def test_dirty_flag_lifecycle(tmp_path, monkeypatch, db_session, seed_users):
 
     anyio.run(scenario)
     gc.collect()
+
+
+def test_ticker_cancelled_before_teardown_write(tmp_path, monkeypatch, db_session, seed_users):
+    """Plan 06-04 (D-13): release() must cancel-and-await the ticker task BEFORE
+    deriving/persisting the final teardown snapshot -- guaranteeing exactly one writer ever
+    runs at teardown, so a stale in-flight tick can never land after (or race) the final
+    write. Instruments persist_snapshot_html itself to assert the ticker task is already
+    done() at the moment the teardown write actually happens, not merely after release()
+    has returned (which would be a much weaker ordering guarantee).
+    """
+    from app.collab import snapshot as collab_snapshot
+
+    monkeypatch.chdir(tmp_path)
+    doc = Document(id="order-1", title="O", content_html="", owner_id=seed_users["alice"].id)
+    db_session.add(doc)
+    db_session.commit()
+
+    ticker_task_ref: dict[str, asyncio.Task] = {}
+    observed_done_at_persist: dict[str, bool] = {}
+    real_persist = collab_snapshot.persist_snapshot_html
+
+    def spying_persist(doc_id, html):
+        observed_done_at_persist["value"] = ticker_task_ref["task"].done()
+        real_persist(doc_id, html)
+
+    monkeypatch.setattr(collab_snapshot, "persist_snapshot_html", spying_persist)
+
+    async def scenario():
+        mgr = RoomManager()
+        room = await mgr.get("order-1")
+        record = mgr._rooms_by_id["order-1"]
+        ticker_task_ref["task"] = record.ticker_task
+
+        room.ydoc.get("config", type=Map)["seeded"] = True
+        frag = room.ydoc.get("default", type=XmlFragment)
+        para = XmlElement("paragraph")
+        frag.children.append(para)
+        para.children.append(XmlText("edited"))
+
+        with anyio.fail_after(5):
+            evicted = await mgr.release("order-1")
+
+        assert evicted is True
+        assert "order-1" not in mgr._rooms_by_id
+        assert record.ticker_task.cancelled() or record.ticker_task.done()
+
+    anyio.run(scenario)
+    gc.collect()
+
+    assert observed_done_at_persist["value"] is True  # ticker was already done when persist ran

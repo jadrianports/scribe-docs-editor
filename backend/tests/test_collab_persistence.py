@@ -1,4 +1,5 @@
 import gc
+import time
 
 import anyio
 from pycrdt import Doc, Map, Text, XmlElement, XmlFragment, XmlText
@@ -231,3 +232,165 @@ def test_tick_refreshes_content_html_for_export_mid_session(
 
     anyio.run(scenario)
     gc.collect()
+
+
+def test_release_persist_timeout_does_not_wedge_teardown(
+    tmp_path, monkeypatch, db_session, seed_users
+):
+    """Plan 06-04 (D-25, criterion 3 + D-24's in-scope DB-lock recovery slice): the persist
+    half is monkeypatched to stall via a blocking `time.sleep` -- persist runs under
+    `asyncio.to_thread`, so a real blocking call (like a locked-DB write) is what actually
+    exercises the bound, not a plain `asyncio.sleep` -- well past RELEASE_SNAPSHOT_TIMEOUT
+    (~2s). This proves the `fail_after` timeout CONTRACT itself, not real SQLite lock timing
+    (RESEARCH Pitfall 3): `release()` must still return, and `room.stop()` must still run,
+    rather than the whole teardown wedging on a stalled write. The other two
+    REQ-snapshot-recovery-tests modes (network disconnect during autosave; WS reconnect with
+    pending title change) are frontend paths handed to Phase 9's criterion 4, not this phase
+    (D-24).
+    """
+    from app.collab import snapshot as collab_snapshot
+
+    def stalling_persist(doc_id, html):
+        time.sleep(5)  # exceeds RELEASE_SNAPSHOT_TIMEOUT (~2s)
+
+    monkeypatch.setattr(collab_snapshot, "persist_snapshot_html", stalling_persist)
+    monkeypatch.chdir(tmp_path)
+    doc = Document(id="stall-1", title="S", content_html="", owner_id=seed_users["alice"].id)
+    db_session.add(doc)
+    db_session.commit()
+
+    async def scenario():
+        mgr = RoomManager()
+        room = await mgr.get("stall-1")
+        room.ydoc.get("config", type=Map)["seeded"] = True
+        frag = room.ydoc.get("default", type=XmlFragment)
+        para = XmlElement("paragraph")
+        frag.children.append(para)
+        para.children.append(XmlText("edited"))
+
+        # Outer safety net for the test itself -- not the ~2s contract under test, which is
+        # enforced inside release() by RELEASE_SNAPSHOT_TIMEOUT.
+        with anyio.fail_after(10):
+            evicted = await mgr.release("stall-1")
+
+        assert evicted is True
+        assert room._task_group is None  # room.stop() ran despite the stalled persist
+
+    anyio.run(scenario)
+    gc.collect()
+
+
+def test_shutdown_flush_writes_only_dirty_rooms(tmp_path, monkeypatch, db_session, seed_users):
+    """Plan 06-04 (D-29): builds two rooms via mgr.get() without releasing -- one
+    seeded+edited (dirty), one seeded but with its dirty flag reset back to False
+    afterward (simulating a room whose snapshot was already taken, i.e. genuinely clean,
+    not merely "never touched") -- then calls `await mgr.shutdown_flush()` directly and
+    asserts the dirty room's content_html updated while the clean room's updated_at did not
+    move. Proves the flush loop itself respects `record.dirty` (D-12), independent of the
+    separate un-seeded guard already covered by test_clean_room_ticker_writes_nothing.
+    """
+    monkeypatch.chdir(tmp_path)
+    dirty_doc = Document(
+        id="flush-dirty", title="D", content_html="", owner_id=seed_users["alice"].id
+    )
+    clean_doc = Document(
+        id="flush-clean", title="C", content_html="<p>stays</p>", owner_id=seed_users["alice"].id
+    )
+    db_session.add_all([dirty_doc, clean_doc])
+    db_session.commit()
+    clean_updated_at = clean_doc.updated_at
+
+    async def scenario():
+        mgr = RoomManager()
+
+        dirty_room = await mgr.get("flush-dirty")
+        dirty_room.ydoc.get("config", type=Map)["seeded"] = True
+        frag = dirty_room.ydoc.get("default", type=XmlFragment)
+        para = XmlElement("paragraph")
+        frag.children.append(para)
+        para.children.append(XmlText("dirty edit"))
+
+        clean_room = await mgr.get("flush-clean")
+        clean_room.ydoc.get("config", type=Map)["seeded"] = True
+        # The seed assignment above flips dirty True via the observe callback (any doc
+        # mutation does) -- reset it directly to model a room that already had its snapshot
+        # taken and genuinely has nothing new to flush.
+        mgr._rooms_by_id["flush-clean"].dirty = False
+
+        await mgr.shutdown_flush()
+
+        await mgr.release("flush-dirty")
+        await mgr.release("flush-clean")
+
+    anyio.run(scenario)
+    gc.collect()
+
+    db_session.expire_all()
+    saved_dirty = db_session.get(Document, "flush-dirty")
+    saved_clean = db_session.get(Document, "flush-clean")
+    assert saved_dirty.content_html == "<p>dirty edit</p>"
+    assert saved_clean.content_html == "<p>stays</p>"
+    assert saved_clean.updated_at == clean_updated_at
+
+
+def test_persist_half_never_receives_ydoc(tmp_path, monkeypatch, db_session, seed_users):
+    """Plan 06-04 (D-30): the thread-affinity boundary the derive/persist split exists to
+    protect -- `persist_snapshot_html` must receive only `str` arguments (doc_id, html),
+    never `room.ydoc` or any other pycrdt object, since pycrdt's Rust-backed types are
+    thread-affine and crash if touched off the event-loop thread that owns them (CLAUDE.md
+    gotcha). Checks this two ways: the function's own signature is exactly (doc_id, html),
+    and every argument actually observed at runtime across a real tick write and a real
+    teardown write is a plain str. `_gc_after_ws_test`'s discipline is honored manually
+    here via the trailing gc.collect() (that autouse fixture is scoped to
+    test_collab_access.py only).
+    """
+    import inspect
+
+    from app.collab import snapshot as collab_snapshot
+
+    assert list(inspect.signature(collab_snapshot.persist_snapshot_html).parameters) == [
+        "doc_id",
+        "html",
+    ]
+
+    monkeypatch.setenv("SCRIBE_SNAPSHOT_INTERVAL", "0.2")
+    monkeypatch.chdir(tmp_path)
+    doc = Document(id="thread-1", title="T", content_html="", owner_id=seed_users["alice"].id)
+    db_session.add(doc)
+    db_session.commit()
+
+    captured_args = []
+    real_persist = collab_snapshot.persist_snapshot_html
+
+    def spying_persist(doc_id, html):
+        captured_args.append((doc_id, html))
+        real_persist(doc_id, html)
+
+    monkeypatch.setattr(collab_snapshot, "persist_snapshot_html", spying_persist)
+
+    async def scenario():
+        mgr = RoomManager()
+        room = await mgr.get("thread-1")
+        room.ydoc.get("config", type=Map)["seeded"] = True
+        frag = room.ydoc.get("default", type=XmlFragment)
+        para = XmlElement("paragraph")
+        frag.children.append(para)
+        para.children.append(XmlText("edit one"))
+        # 0.25s against a 0.2s interval: comfortably past the first tick (which fires and
+        # clears dirty) but with a wide (0.15s) margin before the next tick at 0.4s, so the
+        # edit below and release() below are never racing the ticker's own wakeup -- a
+        # tighter margin here proved flaky under Windows timer-resolution jitter.
+        await anyio.sleep(0.25)
+
+        para2 = XmlElement("paragraph")
+        frag.children.append(para2)
+        para2.children.append(XmlText("edit two"))
+        await mgr.release("thread-1")  # the teardown write also calls persist
+
+    anyio.run(scenario)
+    gc.collect()
+
+    assert len(captured_args) >= 2  # at least one tick write and one teardown write
+    for doc_id_arg, html_arg in captured_args:
+        assert isinstance(doc_id_arg, str)
+        assert isinstance(html_arg, str)
