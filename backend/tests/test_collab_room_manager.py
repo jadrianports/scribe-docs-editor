@@ -53,14 +53,12 @@ def test_crashed_room_task_is_evicted(tmp_path, monkeypatch):
 
         with anyio.fail_after(5):
             room = await mgr.get("doc-crash")
-        assert mgr._rooms["doc-crash"] is room
-        assert isinstance(mgr._room_tasks["doc-crash"], asyncio.Task)
+        assert mgr._rooms_by_id["doc-crash"].room is room
+        assert isinstance(mgr._rooms_by_id["doc-crash"].start_task, asyncio.Task)
 
         await anyio.sleep(0.3)  # let the background task crash and the done-callback run
 
-        assert "doc-crash" not in mgr._rooms
-        assert "doc-crash" not in mgr._room_tasks
-        assert "doc-crash" not in mgr._counts
+        assert "doc-crash" not in mgr._rooms_by_id
 
         # A subsequent connection must get a fresh room, not the dead one.
         with anyio.fail_after(5):
@@ -87,20 +85,18 @@ def test_release_evicts_room_on_last_client(tmp_path, monkeypatch):
         with anyio.fail_after(5):
             room_b = await mgr.get("doc-refcount")
         assert room_a is room_b  # same doc_id -> same cached room, not a duplicate
-        assert mgr._counts["doc-refcount"] == 2
+        assert mgr._rooms_by_id["doc-refcount"].count == 2
 
         with anyio.fail_after(5):
             evicted = await mgr.release("doc-refcount")
         assert evicted is False  # one client remains
-        assert "doc-refcount" in mgr._rooms
-        assert mgr._counts["doc-refcount"] == 1
+        assert "doc-refcount" in mgr._rooms_by_id
+        assert mgr._rooms_by_id["doc-refcount"].count == 1
 
         with anyio.fail_after(5):
             evicted = await mgr.release("doc-refcount")
         assert evicted is True  # last client
-        assert "doc-refcount" not in mgr._rooms
-        assert "doc-refcount" not in mgr._room_tasks
-        assert "doc-refcount" not in mgr._counts
+        assert "doc-refcount" not in mgr._rooms_by_id
 
     anyio.run(scenario)
     gc.collect()
@@ -183,13 +179,12 @@ def test_hung_room_startup_is_bounded_and_does_not_leak_room_tasks(tmp_path, mon
 
         # The doc_id that failed to start must not leave anything cached or
         # leaked: not the room, not the ref count, and -- the specific leak
-        # this hardening fixes -- not a stale entry in _room_tasks either.
-        assert "doc-hang" not in mgr._rooms
-        assert "doc-hang" not in mgr._counts
-        assert "doc-hang" not in mgr._room_tasks
+        # this hardening fixes -- not a stale start_task either (the record
+        # holds all three, so absence of the record is absence of all of them).
+        assert "doc-hang" not in mgr._rooms_by_id
 
         # The healthy, unrelated doc_id is cached normally and cleans up fine.
-        assert "doc-other" in mgr._rooms
+        assert "doc-other" in mgr._rooms_by_id
         with anyio.fail_after(5):
             await mgr.release("doc-other")
 
@@ -239,9 +234,7 @@ def test_release_stops_and_evicts_room_even_if_snapshot_write_fails(tmp_path, mo
             evicted = await mgr.release("doc-snapshot-fail")
 
         assert evicted is True
-        assert "doc-snapshot-fail" not in mgr._rooms
-        assert "doc-snapshot-fail" not in mgr._room_tasks
-        assert "doc-snapshot-fail" not in mgr._counts
+        assert "doc-snapshot-fail" not in mgr._rooms_by_id
         assert room._task_group is None  # i.e. room.stop() actually ran
 
     anyio.run(scenario)
