@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from dataclasses import dataclass
 
 from anyio import Lock, fail_after
@@ -7,6 +8,7 @@ from pycrdt import Doc
 from pycrdt.store import YDocNotFound
 from pycrdt.websocket import YRoom
 
+from . import snapshot
 from .ystore import ScribeYStore
 
 log = logging.getLogger(__name__)
@@ -24,11 +26,13 @@ class RoomRecord:
     """All per-room state RoomManager tracks for a single doc_id.
 
     Consolidates what used to be three parallel dicts (_rooms, _room_tasks,
-    _counts) into one record (D-14), so later work that adds per-doc fields
-    (the tick machinery in plan 03: `dirty`, `ticker_task`,
-    `dirty_subscription`) touches one record field instead of N dict call
-    sites. `dirty` and `ticker_task` are unused this plan -- they exist here
-    so plan 03 doesn't need to touch this dataclass's shape again.
+    _counts) into one record (D-14), so per-doc fields touch one record field
+    instead of N dict call sites. `dirty` is a plain bool the ticker's own
+    `ydoc.observe` callback flips True on any edit (never a value stored
+    inside the Y.Doc itself -- Pitfall 4); `ticker_task` is the per-room
+    `_snapshot_ticker` background task; `dirty_subscription` is the
+    `Subscription` handle returned by that `observe` call, kept only so
+    teardown can optionally unobserve it for hygiene.
     """
 
     doc_id: str
@@ -38,6 +42,51 @@ class RoomRecord:
     dirty: bool = False
     ticker_task: asyncio.Task | None = None
     dirty_subscription: object | None = None
+
+
+async def _snapshot_ticker(doc_id: str, room: YRoom, record: RoomRecord) -> None:
+    """Periodically persist a dirty room's live content to `content_html`.
+
+    Runs for the lifetime of `room`: wakes every `SCRIBE_SNAPSHOT_INTERVAL`
+    seconds (default 15) and, only if an edit landed since the last tick
+    (`record.dirty`), derives sanitized HTML from `room.ydoc` on this
+    (event-loop) thread and persists it in a worker thread. An idle or
+    read-only room costs zero derives and zero SQLite writes (D-01, D-02,
+    D-05, D-12) -- `record.dirty` is checked, not assumed.
+
+    The interval is read once, at task start (not at import time), so tests
+    that construct fresh `RoomManager`/room instances under a monkeypatched
+    `SCRIBE_SNAPSHOT_INTERVAL` see the override (Assumption A1). An
+    unparseable value falls back to 15.0 with a log line -- the ticker must
+    never fail to start over a bad env var (D-06).
+
+    Must never die: any exception raised while deriving or persisting is
+    caught *inside* the loop body (never by a try wrapping the whole
+    `while True`), logged, and `record.dirty` is re-set to True so the next
+    tick retries the same work rather than silently going dark for the rest
+    of the room's life (D-06). `record.dirty` is captured-and-cleared before
+    the awaited persist, so an edit landing mid-persist (or a persist that
+    fails) re-arms the flag for the following tick -- no edit is silently
+    dropped (D-03).
+    """
+    try:
+        interval = float(os.environ.get("SCRIBE_SNAPSHOT_INTERVAL", "15"))
+    except ValueError:
+        log.error("invalid SCRIBE_SNAPSHOT_INTERVAL, falling back to 15s")
+        interval = 15.0
+
+    while True:
+        await asyncio.sleep(interval)  # always wait a full interval first (D-05)
+        if not record.dirty:
+            continue  # nothing changed since the last tick -- no derive, no write
+        record.dirty = False  # capture-and-clear BEFORE the awaited persist (D-03)
+        try:
+            html = snapshot.derive_snapshot_html(room.ydoc)  # loop thread -- owns ydoc
+            if html is not None:
+                await asyncio.to_thread(snapshot.persist_snapshot_html, doc_id, html)
+        except Exception:
+            record.dirty = True  # re-arm so the next tick retries (D-06)
+            log.error("snapshot tick failed for doc %r", doc_id, exc_info=True)
 
 
 class RoomManager:
@@ -66,6 +115,11 @@ class RoomManager:
         check guards the rarer case where a fresh room was already created for
         `doc_id` by the time this (necessarily late) callback runs, so a stale
         callback can never evict a healthy, unrelated room.
+
+        Also cancels the record's `ticker_task`, if any: a crashed room's
+        `ydoc` is of unknown validity, so no snapshot is ever derived from it
+        here -- the ticker is stopped outright, not given one last tick
+        (D-15).
         """
 
         def _on_done(task: asyncio.Task) -> None:
@@ -79,6 +133,10 @@ class RoomManager:
             rec = self._rooms_by_id.get(doc_id)
             if rec is not None and rec.room is room:
                 self._rooms_by_id.pop(doc_id, None)
+                if rec.ticker_task is not None:
+                    rec.ticker_task.cancel()
+                if rec.dirty_subscription is not None:
+                    room.ydoc.unobserve(rec.dirty_subscription)
 
         return _on_done
 
@@ -115,6 +173,7 @@ class RoomManager:
         never fires for a room that was never cached).
         """
         task: asyncio.Task | None = None
+        ticker_task: asyncio.Task | None = None
         try:
             with fail_after(self._startup_timeout):
                 ydoc = Doc()
@@ -144,9 +203,29 @@ class RoomManager:
                 # reading `pycrdt/websocket/yroom.py` after this race
                 # reproduced deterministically (empty YStore after an insert).
                 await room.ydoc_observed.wait()
-            return RoomRecord(doc_id=doc_id, room=room, start_task=task)
+
+                record = RoomRecord(doc_id=doc_id, room=room, start_task=task)
+                # The ticker's own dirty-flag subscription is registered only
+                # now -- after rehydration (`apply_updates`, above) has already
+                # replayed any persisted history into `ydoc` -- so replaying
+                # history does not itself mark a freshly rehydrated, unedited
+                # room dirty (D-12): a session that only ever reads a
+                # rehydrated room costs zero writes. `record.dirty` is a plain
+                # bool on the record, never a value stored inside the Y.Doc
+                # itself (Pitfall 4).
+                def _mark_dirty(event, _record=record) -> None:
+                    _record.dirty = True
+
+                record.dirty_subscription = room.ydoc.observe(_mark_dirty)
+                # One ticker per room, spawned alongside room.start() above --
+                # no global sweeper (D-04).
+                ticker_task = asyncio.create_task(_snapshot_ticker(doc_id, room, record))
+                record.ticker_task = ticker_task
+            return record
         except BaseException:
             log.error("collab room %r failed to start", doc_id, exc_info=True)
+            if ticker_task is not None:
+                ticker_task.cancel()
             if task is not None:
                 task.cancel()
             raise
