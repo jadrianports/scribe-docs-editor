@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from dataclasses import dataclass
 
 from anyio import Lock, fail_after
 from pycrdt import Doc
@@ -18,11 +19,30 @@ log = logging.getLogger(__name__)
 DEFAULT_STARTUP_TIMEOUT = 5.0
 
 
+@dataclass
+class RoomRecord:
+    """All per-room state RoomManager tracks for a single doc_id.
+
+    Consolidates what used to be three parallel dicts (_rooms, _room_tasks,
+    _counts) into one record (D-14), so later work that adds per-doc fields
+    (the tick machinery in plan 03: `dirty`, `ticker_task`,
+    `dirty_subscription`) touches one record field instead of N dict call
+    sites. `dirty` and `ticker_task` are unused this plan -- they exist here
+    so plan 03 doesn't need to touch this dataclass's shape again.
+    """
+
+    doc_id: str
+    room: YRoom
+    start_task: asyncio.Task
+    count: int = 0
+    dirty: bool = False
+    ticker_task: asyncio.Task | None = None
+    dirty_subscription: object | None = None
+
+
 class RoomManager:
     def __init__(self, startup_timeout: float = DEFAULT_STARTUP_TIMEOUT) -> None:
-        self._rooms: dict[str, YRoom] = {}
-        self._room_tasks: dict[str, asyncio.Task] = {}
-        self._counts: dict[str, int] = {}
+        self._rooms_by_id: dict[str, RoomRecord] = {}
         self._lock = Lock()
         self._startup_timeout = startup_timeout
 
@@ -42,8 +62,8 @@ class RoomManager:
         returns with no exception (cancellation is swallowed inside the task
         group, not raised out), and `release()` has already evicted the room
         synchronously before awaiting `stop()` -- so this callback is a no-op
-        in that case. The `self._rooms.get(doc_id) is room` identity check
-        guards the rarer case where a fresh room was already created for
+        in that case. The `self._rooms_by_id.get(doc_id).room is room` identity
+        check guards the rarer case where a fresh room was already created for
         `doc_id` by the time this (necessarily late) callback runs, so a stale
         callback can never evict a healthy, unrelated room.
         """
@@ -56,24 +76,22 @@ class RoomManager:
                 return
             log.error("collab room %r crashed", doc_id, exc_info=exc)
             # Plain sync pop, no lock/await needed -- see identity-check note above.
-            if self._rooms.get(doc_id) is room:
-                self._rooms.pop(doc_id, None)
-                self._room_tasks.pop(doc_id, None)
-                self._counts.pop(doc_id, None)
+            rec = self._rooms_by_id.get(doc_id)
+            if rec is not None and rec.room is room:
+                self._rooms_by_id.pop(doc_id, None)
 
         return _on_done
 
     async def get(self, doc_id: str) -> YRoom:
         async with self._lock:
-            room = self._rooms.get(doc_id)
-            if room is None:
-                room = await self._create_room(doc_id)
-                self._rooms[doc_id] = room
-                self._counts[doc_id] = 0
-            self._counts[doc_id] += 1
-            return room
+            rec = self._rooms_by_id.get(doc_id)
+            if rec is None:
+                rec = await self._create_room(doc_id)
+                self._rooms_by_id[doc_id] = rec
+            rec.count += 1
+            return rec.room
 
-    async def _create_room(self, doc_id: str) -> YRoom:
+    async def _create_room(self, doc_id: str) -> RoomRecord:
         """Build and start a fresh room for `doc_id`.
 
         Called from `get()` while `self._lock` -- the single lock shared by
@@ -89,14 +107,12 @@ class RoomManager:
         "a few seconds," not "forever."
 
         On any failure -- timeout or a genuine exception (e.g. from SQLite) --
-        `self._rooms`/`self._counts` are untouched (this method's return value
-        is only cached by `get()` on success), but `self._room_tasks[doc_id]`
-        may already have been set if the room's start() task was created
-        before the failure -- clean that up too (and cancel the task) so a
-        later get() for the same doc_id doesn't inherit a stale entry that
-        nothing would otherwise ever evict (the crash-evictor's
-        `self._rooms.get(doc_id) is room` guard never fires for a room that
-        was never cached).
+        `self._rooms_by_id` is untouched (this method's return value is only
+        cached by `get()` on success), but the room's start() task may already
+        have been created before the failure -- cancel it so a later get() for
+        the same doc_id doesn't inherit a stale, still-running task (the
+        crash-evictor's `self._rooms_by_id.get(doc_id).room is room` guard
+        never fires for a room that was never cached).
         """
         task: asyncio.Task | None = None
         try:
@@ -114,7 +130,6 @@ class RoomManager:
                 # confirmed-working lower-level lifecycle from the YRoom docstring.
                 task = asyncio.create_task(room.start())
                 task.add_done_callback(self._make_crash_evictor(doc_id, room))
-                self._room_tasks[doc_id] = task
                 await room.started.wait()
                 # `started` only means the task group has launched; the room's
                 # `_watch_ready` background task (which registers the
@@ -129,23 +144,22 @@ class RoomManager:
                 # reading `pycrdt/websocket/yroom.py` after this race
                 # reproduced deterministically (empty YStore after an insert).
                 await room.ydoc_observed.wait()
-            return room
+            return RoomRecord(doc_id=doc_id, room=room, start_task=task)
         except BaseException:
             log.error("collab room %r failed to start", doc_id, exc_info=True)
-            self._room_tasks.pop(doc_id, None)
             if task is not None:
                 task.cancel()
             raise
 
     async def release(self, doc_id: str) -> bool:
         async with self._lock:
-            if doc_id not in self._counts:
+            rec = self._rooms_by_id.get(doc_id)
+            if rec is None:
                 return False
-            self._counts[doc_id] -= 1
-            if self._counts[doc_id] <= 0:
-                room = self._rooms.pop(doc_id)
-                self._counts.pop(doc_id)
-                self._room_tasks.pop(doc_id, None)
+            rec.count -= 1
+            if rec.count <= 0:
+                room = rec.room
+                self._rooms_by_id.pop(doc_id)
                 # Snapshot before stop(): room.ydoc must still be a live,
                 # valid Doc when write_snapshot reads it (Task 7). No actual
                 # import-cycle risk (snapshot.py's own imports -- app.db,
@@ -157,11 +171,11 @@ class RoomManager:
 
                 # A failing snapshot (e.g. a locked DB) must never skip
                 # room.stop() below: doc_id was already popped from
-                # self._rooms/_counts/_room_tasks above (evicted), so nothing
-                # would ever call stop() on THIS room again -- its task
-                # group, its ydoc.observe() subscription, and its YStore
-                # connection would all leak for the life of the process.
-                # Log-and-continue, same pattern as _make_crash_evictor above.
+                # self._rooms_by_id above (evicted), so nothing would ever
+                # call stop() on THIS room again -- its task group, its
+                # ydoc.observe() subscription, and its YStore connection
+                # would all leak for the life of the process. Log-and-continue,
+                # same pattern as _make_crash_evictor above.
                 try:
                     write_snapshot(doc_id, room.ydoc)
                 except Exception:
