@@ -116,11 +116,15 @@ keep in sync with the Python backend, which is what keeps the "one service, one 
 to deploy" story (above) true for this feature too.
 
 **The honest tradeoffs**, stated as plainly as decision 1's:
-- **Export/view can lag active editing.** `content_html` only refreshes when a room
-  *empties*, so exporting or plainly viewing a document while people are still
-  actively co-editing it returns content as of the last time everyone had closed it,
-  not the in-progress edits. A live or periodic snapshot while the room stays open is
-  the natural next step (tracked in the README), not a rewrite.
+- **Export/view can lag active editing, bounded to one interval.** `content_html`
+  is refreshed on a periodic tick — every `SCRIBE_SNAPSHOT_INTERVAL` seconds
+  (default 15) while a room stays dirty — plus on room-empty and on a graceful
+  shutdown flush. So exporting or plainly viewing a document while people are
+  still actively co-editing it returns content that's fresh to within one tick
+  interval, not the exact in-progress edit; it's a bounded, stated tradeoff, not
+  an exact/continuous guarantee. A hard kill (SIGKILL, no chance to run the
+  shutdown flush) still costs at most one tick interval, never the whole
+  session.
 - **A low-probability seed race.** Two clients opening a document that has never been
   collaboratively edited before, at the exact same instant, could both observe
   "not yet seeded" and each insert the saved content before either one's seeded flag

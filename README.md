@@ -192,13 +192,16 @@ two real bugs it caught that the unit tests could not).
   intentionally aligned to **one safe subset**, which is also what makes formatting
   round-trip losslessly and blocks stored XSS. Widening import (links / code) is a
   listed next step.
-- **Real-time collaboration's export/view snapshot can lag active editing** —
-  `content_html` (what Markdown/PDF export and the plain document view read) is
-  refreshed when the *last* editor leaves a document's live session, not
-  continuously while people are still editing it. Exporting a document that's
-  currently being co-edited returns the content as of the last time everyone had
-  closed it, not the in-progress edits. A live or periodic snapshot while a room
-  stays open is a documented next step, not an oversight.
+- **Real-time collaboration's export/view snapshot is fresh to within one
+  interval, not continuous** — `content_html` (what Markdown/PDF export and the
+  plain document view read) is refreshed on a periodic tick, on room-empty, and
+  on a graceful shutdown. The tick runs every `SCRIBE_SNAPSHOT_INTERVAL` seconds
+  (default **~15 seconds**) while a room has unsaved edits — a durability-vs-write-volume
+  dial: lower it for a tighter export lag at the cost of more frequent SQLite
+  writes, raise it for the opposite tradeoff. Exporting a document that's
+  currently being co-edited returns content at most one interval stale, not the
+  exact in-progress edit; a hard crash (no graceful shutdown) costs at most that
+  same interval, not the whole session.
 - **A rare seed race on a document's first-ever collaborative session** — two
   clients opening a document that has never been opened for collaboration before,
   at the exact same instant, could both observe "not yet seeded" and each insert
@@ -250,10 +253,6 @@ two real bugs it caught that the unit tests could not).
 2. **`.docx` upload** via a converter such as `mammoth`, to broaden the import story.
 3. **Widen Markdown import** to preserve links and code blocks (extending the editor
    schema + sanitizer allow-list together).
-4. **A live/periodic HTML snapshot during active co-editing** — right now
-   `content_html` (what export and the plain document view read) only refreshes once
-   a document's collaboration room empties; snapshotting periodically while it's
-   still open would close that lag without changing the Y.Doc source-of-truth model.
 
 ---
 
