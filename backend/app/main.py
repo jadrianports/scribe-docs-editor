@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from starlette.middleware.sessions import SessionMiddleware
 
+from .collab.rooms import room_manager
 from .db import SessionLocal, init_db
 from .routers import auth, collab, documents, export, shares, upload
 from .seed import seed
@@ -24,6 +25,10 @@ async def lifespan(app: FastAPI):
     finally:
         db.close()
     yield
+    # Flush every dirty collab room's snapshot before the process exits --
+    # turns a controlled restart/shutdown into zero collab-session data loss
+    # (a SIGKILL still costs at most one snapshot-ticker interval).
+    await room_manager.shutdown_flush()
 
 
 app = FastAPI(title="Scribe API", lifespan=lifespan)

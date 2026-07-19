@@ -25,6 +25,11 @@ DEFAULT_STARTUP_TIMEOUT = 5.0
 # reconnecting peer as unresponsive, so this is a tighter bound (D-10).
 RELEASE_SNAPSHOT_TIMEOUT = 2.0
 
+# Bounds the whole graceful-shutdown flush loop (all dirty rooms combined),
+# not any single room's persist -- a controlled shutdown can afford a little
+# longer than a single release() (D-11).
+SHUTDOWN_FLUSH_TIMEOUT = 5.0
+
 
 @dataclass
 class RoomRecord:
@@ -287,6 +292,50 @@ class RoomManager:
                 await room.stop()
                 return True
             return False
+
+    async def shutdown_flush(self) -> None:
+        """Persist every dirty room's snapshot on graceful shutdown (D-11).
+
+        Called once from the app lifespan after the ASGI server's `yield`
+        (SIGTERM, `docker stop`, or a controlled `uvicorn --reload` restart),
+        turning every controlled shutdown into zero collab-session data loss
+        -- a SIGKILL still costs at most one `_snapshot_ticker` interval.
+
+        Takes a shallow, lock-free snapshot of the current rooms
+        (`list(self._rooms_by_id.values())`, D-16): this must never become a
+        new caller on `self._lock` -- the shared lock every doc_id serializes
+        through is Phase 7's problem, not this one's -- and a room
+        appearing or vanishing mid-flush (a client connecting/disconnecting
+        during shutdown) is harmless here; it just sees a point-in-time list.
+
+        Bounded by one overall `SHUTDOWN_FLUSH_TIMEOUT`, not a per-room
+        timeout (D-11): a slow shutdown log-and-moves-on rather than hanging
+        the process exit. Within that bound, each dirty room is persisted in
+        its own try/except -- one room's failure (or the ydoc no longer being
+        seeded) does not stop the rest from flushing (D-06 pattern).
+        """
+        records = list(self._rooms_by_id.values())
+        flushed = 0
+        try:
+            with fail_after(SHUTDOWN_FLUSH_TIMEOUT):
+                for record in records:
+                    if not record.dirty:
+                        continue  # idle/read-only room -- zero writes (D-12)
+                    try:
+                        html = snapshot.derive_snapshot_html(record.room.ydoc)
+                        if html is not None:
+                            await asyncio.to_thread(
+                                snapshot.persist_snapshot_html, record.doc_id, html
+                            )
+                        record.dirty = False
+                        flushed += 1
+                    except Exception:
+                        log.error(
+                            "shutdown flush failed for doc %r", record.doc_id, exc_info=True
+                        )
+        except TimeoutError:
+            log.error("shutdown flush timed out -- some dirty rooms may be unflushed")
+        log.info("shutdown flush persisted %d of %d room(s)", flushed, len(records))
 
 
 room_manager = RoomManager()
