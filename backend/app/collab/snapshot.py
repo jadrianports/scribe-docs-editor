@@ -4,10 +4,18 @@ Keeps `documents.content_html` -- the column Markdown/PDF export and the
 plain read view all read from -- fresh across collaborative editing
 sessions. The Yjs document itself (via `ScribeYStore`, in `data/yjs.db`) is
 the durable source of truth for collaborative edits; `content_html` is a
-derived, best-effort snapshot taken when a document's last editor leaves
-(see `RoomManager.release`), so non-collaborative readers (export, the
-plain document view) never see content that's stale relative to the last
-live editing session.
+derived, best-effort snapshot taken on three triggers -- a room emptying
+(`RoomManager.release`), a periodic dirty-flag tick, and a graceful shutdown
+flush -- so non-collaborative readers (export, the plain document view)
+never see content that's stale relative to the last live editing session.
+
+Split into a derive half (`derive_snapshot_html`) and a persist half
+(`persist_snapshot_html`): the derive half must run on the event-loop thread
+that owns the pycrdt `Doc` (pycrdt objects are thread-affine and crash if
+touched off-thread), while the persist half is a plain SQLite write that is
+safe to run anywhere -- only the finished HTML string, never the `Doc`,
+crosses into a worker thread. `write_snapshot` composes the two for callers
+that don't need to split them across threads themselves.
 """
 
 from pycrdt import Doc, Map
@@ -18,23 +26,19 @@ from ..models import Document
 from .html import ydoc_to_html
 
 
-def write_snapshot(doc_id: str, ydoc: Doc) -> None:
-    """Derive sanitized HTML from `ydoc` and store it on `documents.content_html`.
+def derive_snapshot_html(ydoc: Doc) -> str | None:
+    """Derive sanitized HTML from `ydoc`, or None if it should not be written.
 
-    Mandatory invariant: the HTML written here has always passed through
+    Mandatory invariant: the HTML returned here has always passed through
     `sanitize_html` first -- `ydoc_to_html`'s output is documented/tested as
     already stable under that sanitizer (Task 6), but this function does not
     trust that claim silently; it re-applies the same allow-list every
     document write already goes through (uploads, edits), so this is never a
     second, divergent sanitizer.
 
-    Opens its own `SessionLocal()` rather than accepting a `Session`:
-    `RoomManager.release()` (the only caller) has no request-scoped session
-    to pass down -- a WebSocket disconnect isn't a single DI-scoped HTTP
-    request the way `Depends(get_db)` routes are. Silently no-ops if the
-    document was deleted out from under a live room (`document is None`)
-    rather than raising, since a room emptying is not the place to surface
-    that as an error.
+    Must run on the event-loop thread that owns `ydoc`: `ydoc_to_html` walks
+    live pycrdt objects, which are thread-affine and crash if touched off the
+    thread that created/mutated them.
 
     CRITICAL guard (final whole-branch review): also silently no-ops if
     `ydoc` was never *seeded*. A brand-new/never-collaborated document's Y.Doc
@@ -59,8 +63,25 @@ def write_snapshot(doc_id: str, ydoc: Doc) -> None:
     separately guessing/reimplementing that contract server-side.
     """
     if not ydoc.get("config", type=Map).get("seeded"):
-        return
-    html = sanitize_html(ydoc_to_html(ydoc))  # the sanitization invariant holds here
+        return None
+    return sanitize_html(ydoc_to_html(ydoc))  # the sanitization invariant holds here
+
+
+def persist_snapshot_html(doc_id: str, html: str) -> None:
+    """Store `html` on `documents.content_html` for `doc_id`.
+
+    Receives only two strings -- never `ydoc` or any other pycrdt object --
+    so this half never crosses the thread-affinity boundary the derive half
+    is bound by; it is safe to call from a worker thread.
+
+    Opens its own `SessionLocal()` rather than accepting a `Session`: none of
+    this function's callers (a room emptying, a periodic tick, a shutdown
+    flush) have a request-scoped session to pass down -- none of them is a
+    single DI-scoped HTTP request the way `Depends(get_db)` routes are.
+    Silently no-ops if the document was deleted out from under a live room
+    (`document is None`) rather than raising, since that is not the place to
+    surface that as an error.
+    """
     db = SessionLocal()
     try:
         document = db.get(Document, doc_id)
@@ -69,3 +90,16 @@ def write_snapshot(doc_id: str, ydoc: Doc) -> None:
             db.commit()  # onupdate bumps updated_at
     finally:
         db.close()
+
+
+def write_snapshot(doc_id: str, ydoc: Doc) -> None:
+    """Derive sanitized HTML from `ydoc` and store it on `documents.content_html`.
+
+    A thin synchronous composition of `derive_snapshot_html` and
+    `persist_snapshot_html`, kept for callers that run entirely on the
+    event-loop thread and don't need to split the derive/persist halves
+    across a thread boundary themselves.
+    """
+    html = derive_snapshot_html(ydoc)
+    if html is not None:
+        persist_snapshot_html(doc_id, html)
