@@ -256,6 +256,73 @@ def test_heading_level_infinite_falls_back_to_h1():
     assert sanitize_html(html) == html
 
 
+def test_full_schema_roundtrip_is_sanitizer_stable():
+    # D-27: a single document exercising every tag in content.ALLOWED_TAGS
+    # (p, br, strong, em, u, s, h1-h3, ul, ol, li, blockquote), proving
+    # ydoc_to_html's output is structurally stable under sanitize_html across
+    # the whole aligned schema, not just per-node-type in isolation.
+    doc = Doc()
+    frag = _fragment(doc)
+
+    # paragraph: hardBreak + text runs carrying each mark, plus a combined
+    # multi-mark run.
+    para = XmlElement("paragraph")
+    frag.children.append(para)
+    text = XmlText()
+    para.children.append(text)
+    text.insert(0, "plain", None)
+    text.insert(len(text), " ", None)
+    text.insert(len(text), "bold", {"bold": {}})
+    text.insert(len(text), " ", None)
+    text.insert(len(text), "italic", {"italic": {}})
+    text.insert(len(text), " ", None)
+    text.insert(len(text), "underline", {"underline": {}})
+    text.insert(len(text), " ", None)
+    text.insert(len(text), "strike", {"strike": {}})
+    text.insert(len(text), " ", None)
+    text.insert(len(text), "combo", {"bold": {}, "italic": {}, "underline": {}, "strike": {}})
+    para.children.append(XmlElement("hardBreak"))
+    text2 = XmlText()
+    para.children.append(text2)
+    text2.insert(0, "after break", None)
+
+    # headings h1-h3
+    for level in (1, 2, 3):
+        heading = XmlElement("heading", {"level": level})
+        frag.children.append(heading)
+        heading.children.append(XmlText(f"Heading {level}"))
+
+    # bulletList with two listItem>paragraph items
+    bullet_list = XmlElement("bulletList")
+    frag.children.append(bullet_list)
+    for item_text in ["First", "Second"]:
+        item = XmlElement("listItem")
+        bullet_list.children.append(item)
+        item_para = XmlElement("paragraph")
+        item.children.append(item_para)
+        item_para.children.append(XmlText(item_text))
+
+    # orderedList with a listItem>paragraph
+    ordered_list = XmlElement("orderedList")
+    frag.children.append(ordered_list)
+    ordered_item = XmlElement("listItem")
+    ordered_list.children.append(ordered_item)
+    ordered_item_para = XmlElement("paragraph")
+    ordered_item.children.append(ordered_item_para)
+    ordered_item_para.children.append(XmlText("Only"))
+
+    # blockquote wrapping a paragraph
+    quote = XmlElement("blockquote")
+    frag.children.append(quote)
+    quote_para = XmlElement("paragraph")
+    quote.children.append(quote_para)
+    quote_para.children.append(XmlText("quoted"))
+
+    html = ydoc_to_html(doc)
+
+    assert sanitize_html(html) == html
+
+
 def test_heading_misplaced_inside_heading_is_sanitizer_stable():
     # Same inline-context hazard, the heading half: html5lib pops an open
     # heading when it meets ANOTHER heading start tag (empirically verified
