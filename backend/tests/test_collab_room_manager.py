@@ -11,9 +11,11 @@ import gc
 import time
 
 import anyio
+from pycrdt import Map, Text, XmlElement, XmlFragment, XmlText
 from pycrdt.websocket import YRoom
 
 from app.collab.rooms import RoomManager
+from app.models import Document
 
 # pycrdt's Rust-backed Doc/Subscription objects are thread-affine (`!Send`)
 # (see task-1-report.md's "Secondary finding"): if one gets garbage-collected
@@ -236,6 +238,82 @@ def test_release_stops_and_evicts_room_even_if_snapshot_write_fails(tmp_path, mo
         assert evicted is True
         assert "doc-snapshot-fail" not in mgr._rooms_by_id
         assert room._task_group is None  # i.e. room.stop() actually ran
+
+    anyio.run(scenario)
+    gc.collect()
+
+
+def test_clean_room_ticker_writes_nothing(tmp_path, monkeypatch, db_session, seed_users):
+    """Plan 06-04 (D-12): an idle/never-seeded room's ticker must derive and write nothing --
+    closing a read-only-viewer session (or a room that only ever touches a scratch root,
+    mirroring test_release_does_not_overwrite_content_when_room_never_seeded in
+    test_collab_persistence.py) costs zero SQLite writes and never bumps `updated_at` on an
+    unrelated document, across at least one tick interval, with no release() call before the
+    assertion.
+    """
+    monkeypatch.setenv("SCRIBE_SNAPSHOT_INTERVAL", "0.05")
+    monkeypatch.chdir(tmp_path)
+    doc = Document(
+        id="clean-1", title="C", content_html="<p>original</p>", owner_id=seed_users["alice"].id
+    )
+    db_session.add(doc)
+    db_session.commit()
+    original_updated_at = doc.updated_at
+
+    async def scenario():
+        mgr = RoomManager()
+        room = await mgr.get("clean-1")
+        # Touches only a scratch root -- "default"/"config" are never touched, so this room
+        # is never seeded (mirrors test_collab_persistence.py's un-seeded-guard tests).
+        room.ydoc.get("scratch", type=Text).insert(0, "not the document body")
+        await anyio.sleep(0.3)  # past a couple of 0.05s tick intervals
+        await mgr.release("clean-1")
+
+    anyio.run(scenario)
+    gc.collect()
+
+    db_session.expire_all()
+    saved = db_session.get(Document, "clean-1")
+    assert saved.content_html == "<p>original</p>"
+    assert saved.updated_at == original_updated_at
+
+
+def test_dirty_flag_lifecycle(tmp_path, monkeypatch, db_session, seed_users):
+    """Plan 06-04 (D-28): drives `RoomRecord.dirty` through all four transitions the tick,
+    teardown, and shutdown-flush writers all depend on: fresh=clean (right after get(),
+    before any edit), seed->dirty (the ticker's own `ydoc.observe` callback flips it True
+    the instant `config`/`seeded` is set), snapshot->clean (after one tick derives+persists,
+    the capture-and-clear-before-persist step resets it), edit->dirty (a further edit
+    re-arms it). Losing any one of these transitions silently regresses into a room that
+    never writes (dirty stuck False -> lost edits) or writes every tick regardless of
+    whether anything changed (dirty stuck True -> write amplification).
+    """
+    monkeypatch.setenv("SCRIBE_SNAPSHOT_INTERVAL", "0.05")
+    monkeypatch.chdir(tmp_path)
+    doc = Document(id="dirty-1", title="D", content_html="", owner_id=seed_users["alice"].id)
+    db_session.add(doc)
+    db_session.commit()
+
+    async def scenario():
+        mgr = RoomManager()
+        room = await mgr.get("dirty-1")
+        record = mgr._rooms_by_id["dirty-1"]
+
+        assert record.dirty is False  # fresh=clean
+
+        room.ydoc.get("config", type=Map)["seeded"] = True  # mirror EditorPage.tsx's seed effect
+        assert record.dirty is True  # seed->dirty
+
+        await anyio.sleep(0.3)  # let one tick derive+persist and clear the flag
+        assert record.dirty is False  # snapshot->clean
+
+        frag = room.ydoc.get("default", type=XmlFragment)
+        para = XmlElement("paragraph")
+        frag.children.append(para)
+        para.children.append(XmlText("further edit"))
+        assert record.dirty is True  # edit->dirty
+
+        await mgr.release("dirty-1")
 
     anyio.run(scenario)
     gc.collect()

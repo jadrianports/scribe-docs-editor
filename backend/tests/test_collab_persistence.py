@@ -1,3 +1,5 @@
+import gc
+
 import anyio
 from pycrdt import Doc, Map, Text, XmlElement, XmlFragment, XmlText
 from app.collab.rooms import RoomManager
@@ -192,3 +194,40 @@ def test_write_snapshot_noops_for_unknown_doc_id(tmp_path, monkeypatch, db_sessi
     ydoc = Doc()
     ydoc.get("config", type=Map)["seeded"] = True
     collab_snapshot.write_snapshot("does-not-exist", ydoc)  # must not raise
+
+
+def test_tick_refreshes_content_html_for_export_mid_session(
+    tmp_path, monkeypatch, db_session, seed_users
+):
+    """Plan 06-04 (D-26): proves criteria 1+2 in-process -- a seeded+mutated room, given a
+    tiny SCRIBE_SNAPSHOT_INTERVAL, has content_html reflecting the edit after one tick, with
+    NO release() call before the assertion runs. The column read here (`documents.content_html`)
+    is exactly what Markdown/PDF export and the plain document view already query (D-07,
+    unchanged read path) -- so this is also the criterion-2 proof: an editor never has to
+    disconnect for export to see their latest edit.
+    """
+    monkeypatch.setenv("SCRIBE_SNAPSHOT_INTERVAL", "0.05")
+    monkeypatch.chdir(tmp_path)
+    doc = Document(id="tick-1", title="T", content_html="", owner_id=seed_users["alice"].id)
+    db_session.add(doc)
+    db_session.commit()
+
+    async def scenario():
+        mgr = RoomManager()
+        room = await mgr.get("tick-1")
+        room.ydoc.get("config", type=Map)["seeded"] = True  # mirror EditorPage.tsx's seed effect
+        frag = room.ydoc.get("default", type=XmlFragment)
+        para = XmlElement("paragraph")
+        frag.children.append(para)
+        para.children.append(XmlText("mid-session edit"))
+
+        await anyio.sleep(0.3)  # past one 0.05s tick interval -- no release() call before this
+
+        db_session.expire_all()  # the tick wrote via a different Session
+        saved = db_session.get(Document, "tick-1")
+        assert saved.content_html == "<p>mid-session edit</p>"
+
+        await mgr.release("tick-1")
+
+    anyio.run(scenario)
+    gc.collect()
