@@ -81,6 +81,16 @@ changes, just an "Apply" in Render. (An earlier draft targeted Koyeb, but Koyeb 
 acquired by Mistral and shut down its self-serve deploy product; `DEPLOY.md` notes
 this.)
 
+The container image is **secure by default**: it sets `SCRIBE_ENV=production`, which
+makes a missing `SECRET_KEY` fatal at startup, marks the session cookie `Secure`, and
+warns loudly if `SCRIBE_DATA_DIR` isn't an absolute, persistent path — so a
+misconfigured deploy fails loudly instead of quietly running insecurely. Render
+generates `SECRET_KEY` for you; any other host that forgets to set it now refuses to
+boot rather than falling back to a known key. Locally, `docker-compose.yml` opts back
+out to `SCRIBE_ENV=dev`, so `docker compose up --build` stays the zero-config command
+described above — see [`DEPLOY.md`](DEPLOY.md) for the full environment-variable
+reference.
+
 Real-time collaboration travels with that single-service deploy for free. The
 collaboration WebSocket trusts a **same-origin** request automatically, and this
 deploy is always same-origin (the SPA and the API share one
