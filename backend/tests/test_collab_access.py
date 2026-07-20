@@ -60,6 +60,45 @@ def test_non_collaborator_is_rejected(client, a_doc, seed_users, login):
             ws.receive_bytes()
 
 
+def test_is_valid_doc_id_accepts_real_uuids_and_rejects_garbage():
+    """Minor #7 / spec §7 ("Validate doc_id is a UUID before it is used as a
+    room name," docs/superpowers/specs/2026-07-15-realtime-collaboration-
+    design.md): direct unit coverage of the validator itself. Route-level
+    behavior is covered separately (`test_malformed_doc_id_is_rejected`
+    below) because the WS route's OBSERVABLE close code is identical
+    whether a malformed doc_id is rejected by this check or falls through
+    to `_authorize`'s pre-existing "document not found" branch -- a garbage
+    string can never match a real `str(uuid.uuid4())` id in the documents
+    table either way, so that alone can't discriminate pre-fix from
+    post-fix behavior the way this direct check can.
+    """
+    from app.routers.collab import _is_valid_doc_id
+
+    assert _is_valid_doc_id(str(uuid.uuid4())) is True
+    assert _is_valid_doc_id("fb89b9c6-6fea-48f5-b8af-ce5b433fa6b7") is True
+    assert _is_valid_doc_id("fb89b9c66fea48f5b8afce5b433fa6b7") is True  # no dashes, still valid
+    assert _is_valid_doc_id("not-a-uuid") is False
+    assert _is_valid_doc_id("") is False
+    assert _is_valid_doc_id("../../etc/passwd") is False
+    assert _is_valid_doc_id("' OR 1=1--") is False
+    assert _is_valid_doc_id("fb89b9c6-6fea-48f5-b8af-ce5b433fa6b7é") is False  # non-ASCII tail
+    assert _is_valid_doc_id(" fb89b9c6-6fea-48f5-b8af-ce5b433fa6b7 ") is False  # whitespace-padded
+
+
+def test_malformed_doc_id_is_rejected(client, seed_users, login):
+    """Route-level regression coverage: a malformed doc_id must never reach
+    `_authorize`'s DB lookup or `RoomManager`, and must close with the same
+    non-leak 4404 a well-formed-but-inaccessible doc_id gets
+    (`test_non_collaborator_is_rejected`) -- so a malformed id is never
+    distinguishable, from the outside, from "you can't see this document."
+    """
+    login("alice@example.com")
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with client.websocket_connect("/api/collab/not-a-uuid") as ws:
+            ws.receive_bytes()
+    assert exc_info.value.code == 4404
+
+
 def test_owner_can_connect(client, a_doc, login):
     login("alice@example.com")
     with client.websocket_connect(f"/api/collab/{a_doc.id}") as ws:
