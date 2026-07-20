@@ -8,13 +8,15 @@ startup awaits with no timeout -- see test_hung_room_startup_is_bounded... .
 
 import asyncio
 import gc
+import sys
 import time
+import weakref
 
 import anyio
 from pycrdt import Map, Text, XmlElement, XmlFragment, XmlText
 from pycrdt.websocket import YRoom
 
-from app.collab.rooms import RoomManager
+from app.collab.rooms import RoomManager, RoomRecord, _make_dirty_marker
 from app.models import Document
 
 # pycrdt's Rust-backed Doc/Subscription objects are thread-affine (`!Send`)
@@ -384,3 +386,102 @@ def test_ticker_cancelled_before_teardown_write(tmp_path, monkeypatch, db_sessio
     gc.collect()
 
     assert observed_done_at_persist["value"] is True  # ticker was already done when persist ran
+
+
+def test_dirty_marker_holds_no_strong_reference_to_record():
+    """Plan 06-06 (Task 1): pins the exact property the weakref-based fix exists to
+    guarantee -- `_make_dirty_marker`'s returned callback closes over ONLY a weak
+    reference to its `RoomRecord`, never the record itself. A pure unit test: no
+    RoomManager, no event loop, no threads, no timing -- `RoomRecord` performs no
+    runtime validation, so placeholder `None`s for `room`/`start_task` are fine here.
+
+    Two halves, both required:
+
+    1. Behavioral: the record starts clean and invoking the marker sets `dirty`
+       True. This guards against a "fix" that silently stops marking rooms dirty
+       -- that would regress D-12 into rooms that never write, i.e. silent data
+       loss dressed up as a passing test suite.
+    2. Structural: a `weakref.ref` to the record goes dead the instant the only
+       local strong reference is dropped -- proving refcounting ALONE reclaims
+       the record, with no cyclic-GC assist. Deliberately NO `gc.collect()` call
+       appears anywhere before this assertion (and must never be added): a
+       collect() here would make the assertion pass even if the cycle were fully
+       restored (e.g. reverting to the old default-argument-capture marker),
+       converting a real regression test into one that can never go red again.
+    """
+    record = RoomRecord(doc_id="x", room=None, start_task=None)
+    marker = _make_dirty_marker(record)
+
+    assert record.dirty is False
+    marker(None)
+    assert record.dirty is True
+
+    ref = weakref.ref(record)
+    del record
+    assert ref() is None, "record survived refcounting -- the reference cycle is still present"
+
+
+def test_abandoned_room_subscription_is_not_finalized_on_worker_thread(tmp_path, monkeypatch):
+    """Plan 06-06 (Task 2/VERIFICATION truth #9): the direct encoding of the
+    reproduced panic -- `pycrdt::subscription::Subscription is unsendable, but is
+    being dropped on another thread`. Builds a genuinely seeded+dirty room (a live
+    `dirty_subscription` Subscription exists), releases it (running the Task 2
+    teardown path: unobserve + clear + gc.collect on the event-loop thread), drops
+    every local strong reference, then deliberately schedules a cyclic-GC pass on a
+    REAL worker thread via `asyncio.to_thread(gc.collect)` -- exactly the condition
+    that crashes the unfixed marker.
+
+    Installs a capturing replacement for `sys.unraisablehook` via
+    `monkeypatch.setattr` (monkeypatch restores the original automatically).
+    pytest's own unraisable plugin hooks the same attribute, so this deliberately
+    takes over for the duration of the test. The hook fires on whichever thread
+    finalizes the offending object, so the list is appended to from the worker
+    thread spawned by `asyncio.to_thread` above -- a plain list append is safe
+    under the GIL, so no lock is needed around it.
+
+    Asserts on the captured contents (not merely on the list being empty) so a
+    failure names the offending object/exception directly, rather than just
+    reporting a count.
+    """
+    monkeypatch.chdir(tmp_path)
+
+    captured: list[object] = []
+
+    def capturing_hook(args):
+        captured.append(args)
+
+    monkeypatch.setattr(sys, "unraisablehook", capturing_hook)
+
+    async def scenario():
+        gc.disable()  # TEMP EXPERIMENT: prevent auto-GC from masking the isolation
+        mgr = RoomManager()
+        room = await mgr.get("abandoned-1")
+        record = mgr._rooms_by_id["abandoned-1"]
+
+        room.ydoc.get("config", type=Map)["seeded"] = True  # mirror EditorPage.tsx's seed effect
+        frag = room.ydoc.get("default", type=XmlFragment)
+        para = XmlElement("paragraph")
+        frag.children.append(para)
+        para.children.append(XmlText("edited"))
+        assert record.dirty is True  # genuinely dirty, not just seeded
+
+        with anyio.fail_after(5):
+            evicted = await mgr.release("abandoned-1")
+        assert evicted is True
+
+        del room, record, mgr  # drop every local strong reference
+
+        # A cyclic-GC pass deliberately scheduled on a real worker thread --
+        # exactly the condition that panics the unfixed default-argument marker.
+        await asyncio.to_thread(gc.collect)
+
+    anyio.run(scenario)
+    gc.collect()  # file convention -- main-thread collect after anyio.run
+
+    offending = [
+        args
+        for args in captured
+        if isinstance(args.exc_value, RuntimeError)
+        and ("unsendable" in str(args.exc_value) or "dropped on another thread" in str(args.exc_value))
+    ]
+    assert not offending, f"pycrdt Subscription finalized off its creating thread: {offending!r}"
