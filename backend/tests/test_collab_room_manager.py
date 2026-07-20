@@ -485,3 +485,46 @@ def test_abandoned_room_subscription_is_not_finalized_on_worker_thread(tmp_path,
         and ("unsendable" in str(args.exc_value) or "dropped on another thread" in str(args.exc_value))
     ]
     assert not offending, f"pycrdt Subscription finalized off its creating thread: {offending!r}"
+
+
+def test_release_clears_the_yroom_internal_subscription(tmp_path, monkeypatch):
+    """`release()` must drop YRoom's own strong edge to its internal pycrdt
+    `Subscription`, not just the record's `dirty_subscription`.
+
+    `YRoom.stop()` unobserves that handle but never sets `self._subscription =
+    None`, so the Subscription stays reachable from the YRoom -- and the YRoom
+    outlives `stop()` via its cancelled `start()`/`_broadcast_updates` task
+    frames. The graph then becomes cyclic garbage collected on whatever thread
+    gets there first, which panics because pycrdt Subscriptions are
+    thread-affine (D-08, D-30). Under `TestClient`'s per-connection portal
+    thread the creating thread is already dead by then, so there is no safe
+    thread left at all -- this is what made the four WebSocket tests in
+    test_collab_access.py error once the record leak that had been masking it
+    was fixed.
+
+    Asserting the handle is non-None *before* release is load-bearing: without
+    it this test would still pass if pycrdt-websocket stopped registering a
+    subscription at all, quietly becoming vacuous.
+    """
+    monkeypatch.chdir(tmp_path)
+
+    async def scenario():
+        mgr = RoomManager()
+
+        with anyio.fail_after(5):
+            room = await mgr.get("doc-yroom-sub")
+
+        # Precondition: the library really does hold a subscription here.
+        assert getattr(room, "_subscription", None) is not None
+
+        with anyio.fail_after(5):
+            evicted = await mgr.release("doc-yroom-sub")
+        assert evicted is True
+
+        assert getattr(room, "_subscription", "missing") is None, (
+            "YRoom._subscription survived release() -- the Subscription's lifetime "
+            "is still bound to the YRoom's and can be finalized off-thread"
+        )
+
+    anyio.run(scenario)
+    gc.collect()

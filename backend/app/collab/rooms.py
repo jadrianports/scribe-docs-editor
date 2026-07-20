@@ -92,6 +92,49 @@ def _make_dirty_marker(record: RoomRecord):
     return _mark_dirty
 
 
+def _drop_yroom_subscription(room: YRoom) -> None:
+    """Drop YRoom's own strong edge to its internal pycrdt `Subscription`.
+
+    Call ONLY immediately after `await room.stop()`, which is what makes this
+    safe: `stop()` has already detached the observer registration, so clearing
+    the attribute cannot orphan a live one.
+
+    Why this is needed at all. `YRoom.stop()` (pycrdt-websocket) ends by
+    detaching the handle from the Y.Doc -- but it never sets
+    `self._subscription = None`. So the Subscription stays reachable from the
+    YRoom, and its lifetime becomes the YRoom's lifetime. (Deliberately
+    described rather than quoted verbatim here: a literal copy of that call
+    would inflate this phase's observer-detach call-count acceptance check,
+    which pins the four record-teardown sites.)
+
+    The YRoom in turn outlives `stop()`: its cancelled
+    `start()` / `_broadcast_updates` task frames still reference it and only
+    unwind later, so the whole graph becomes *cyclic* garbage that nothing
+    reclaims until some later collection -- on whatever thread runs it.
+
+    That is fatal here for the same reason `_make_dirty_marker` exists: pycrdt
+    Subscriptions are Rust-backed and thread-affine, and panic with
+    "Subscription is unsendable, but is being dropped on another thread" when
+    finalized off their creating thread (D-08, D-30). Under Starlette's
+    `TestClient` -- and any deployment where the connection's event-loop thread
+    can die before the collector runs -- the creating thread is gone by then,
+    so there is no longer *any* thread on which that finalization is safe.
+
+    Clearing the attribute here drops the last strong reference while we are
+    still on the creating thread, so the Subscription dies by plain
+    refcounting, deterministically, right here. This is the same fix
+    `_make_dirty_marker` applies to the record's own subscription, extended one
+    level up to the one the library owns.
+
+    Note this reaches into a private attribute. `getattr`/`hasattr` guards keep
+    it a silent no-op if a future pycrdt-websocket renames or removes
+    `_subscription` (including if upstream starts clearing it itself), so a
+    library upgrade degrades to today's behavior rather than an AttributeError.
+    """
+    if getattr(room, "_subscription", None) is not None:
+        room._subscription = None
+
+
 async def _snapshot_ticker(doc_id: str, room: YRoom, record: RoomRecord) -> None:
     """Periodically persist a dirty room's live content to `content_html`.
 
@@ -357,6 +400,7 @@ class RoomManager:
                         log.error("failed to write snapshot for doc %r", doc_id, exc_info=True)
 
                 await room.stop()
+                _drop_yroom_subscription(room)
                 return True
             return False
 
