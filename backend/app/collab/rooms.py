@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import logging
 import os
 import weakref
@@ -184,6 +185,8 @@ class RoomManager:
                     rec.ticker_task.cancel()
                 if rec.dirty_subscription is not None:
                     room.ydoc.unobserve(rec.dirty_subscription)
+                    rec.dirty_subscription = None
+                    gc.collect()  # finalize the Subscription here, on the event-loop thread (D-08, D-30)
 
         return _on_done
 
@@ -221,6 +224,7 @@ class RoomManager:
         """
         task: asyncio.Task | None = None
         ticker_task: asyncio.Task | None = None
+        record: RoomRecord | None = None
         try:
             with fail_after(self._startup_timeout):
                 ydoc = Doc()
@@ -272,6 +276,16 @@ class RoomManager:
                 ticker_task.cancel()
             if task is not None:
                 task.cancel()
+            # The observe() registration above sits shortly before this try
+            # block would otherwise succeed, so a fail_after timeout (or any
+            # other exception) can fire in that narrow window and abandon a
+            # registered Subscription that nothing else would ever unobserve
+            # -- same finalize-on-the-event-loop-thread rationale as the
+            # other three teardown sites (D-08, D-30).
+            if record is not None and record.dirty_subscription is not None:
+                record.room.ydoc.unobserve(record.dirty_subscription)
+                record.dirty_subscription = None
+                gc.collect()
             raise
 
     async def release(self, doc_id: str) -> bool:
@@ -288,9 +302,26 @@ class RoomManager:
                 # the final snapshot below (D-13): this guarantees exactly one
                 # writer ever runs at teardown -- a stale in-flight tick can
                 # never land after (or race) this final write. Unobserving
-                # the dirty subscription here is discretionary hygiene (A2):
-                # `room.ydoc` and `record` are both about to be dropped, so
-                # it's GC-safe either way, but it costs nothing to be tidy.
+                # the dirty subscription (and clearing the handle, and
+                # collecting) here is mandatory, not discretionary hygiene:
+                # it drops the record's own strong edge to the Subscription so
+                # it's finalized by refcounting on THIS (event-loop) thread,
+                # before the asyncio.to_thread persist below can schedule a
+                # worker thread that might otherwise cross the cyclic-GC
+                # threshold and panic on a still-cyclic, thread-affine
+                # pycrdt Subscription (D-08, D-30). gc.collect() here is a
+                # synchronous full collection inside release()'s single
+                # shared lock (CLAUDE.md), so this adds collection time to
+                # that critical section -- accepted because room teardown is
+                # a rare event (the last client disconnecting) against a
+                # small heap, versus the alternative of a reproducible pycrdt
+                # panic; Phase 7's per-doc lock work should revisit this.
+                # With Task 1's cycle already broken, the Subscription itself
+                # is freed by refcounting the instant record's last strong
+                # reference drops -- this collect is defense in depth, to
+                # deterministically sweep any OTHER cyclic garbage YRoom or
+                # pycrdt-websocket may own before a worker thread can cross
+                # the threshold first.
                 if rec.ticker_task is not None:
                     rec.ticker_task.cancel()
                     try:
@@ -299,6 +330,8 @@ class RoomManager:
                         pass
                 if rec.dirty_subscription is not None:
                     room.ydoc.unobserve(rec.dirty_subscription)
+                    rec.dirty_subscription = None
+                    gc.collect()
 
                 # Only derive+persist a snapshot if an edit landed since the
                 # last successful write (D-12) -- room.ydoc must still be a
@@ -349,6 +382,24 @@ class RoomManager:
         seeded) does not stop the rest from flushing (D-06 pattern).
         """
         records = list(self._rooms_by_id.values())
+
+        # Pre-pass: unobserve+clear every still-registered dirty subscription
+        # on THIS (event-loop) thread, then collect once, before the flush
+        # loop below can schedule its first asyncio.to_thread persist. Same
+        # rationale as release() (D-08, D-30) -- drop the record's own strong
+        # edge to the Subscription so it's finalized by refcounting here,
+        # not swept by a worker thread's cyclic GC. Iterates the SAME
+        # `records` shallow copy and does NOT touch record.dirty and takes
+        # no lock (D-16): the set of rooms flushed, and the order they flush
+        # in, is unchanged by this pass. Deliberately outside the
+        # fail_after(SHUTDOWN_FLUSH_TIMEOUT) block below, so cleanup work
+        # never consumes the flush budget.
+        for record in records:
+            if record.dirty_subscription is not None:
+                record.room.ydoc.unobserve(record.dirty_subscription)
+                record.dirty_subscription = None
+        gc.collect()
+
         flushed = 0
         try:
             with fail_after(SHUTDOWN_FLUSH_TIMEOUT):
