@@ -6,7 +6,7 @@ from fastapi.responses import FileResponse
 from starlette.middleware.sessions import SessionMiddleware
 
 from .collab.rooms import room_manager
-from .config import is_production, resolve_secret_key
+from .config import is_production, resolve_secret_key, validate_data_dir
 from .db import SessionLocal, init_db
 from .routers import auth, collab, documents, export, shares, upload
 from .seed import seed
@@ -19,6 +19,7 @@ FRONTEND_DIST = os.path.normpath(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    validate_data_dir()
     init_db()
     db = SessionLocal()
     try:
