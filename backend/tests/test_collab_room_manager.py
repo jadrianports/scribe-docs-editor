@@ -453,7 +453,6 @@ def test_abandoned_room_subscription_is_not_finalized_on_worker_thread(tmp_path,
     monkeypatch.setattr(sys, "unraisablehook", capturing_hook)
 
     async def scenario():
-        gc.disable()  # TEMP EXPERIMENT: prevent auto-GC from masking the isolation
         mgr = RoomManager()
         room = await mgr.get("abandoned-1")
         record = mgr._rooms_by_id["abandoned-1"]
