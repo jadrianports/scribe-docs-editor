@@ -51,9 +51,15 @@ services), or click **Manual Deploy** in the Render dashboard.
 | Variable | Purpose | Default |
 |---|---|---|
 | `PORT` | Port the server binds to | Render injects it; container falls back to `8000` locally |
-| `SECRET_KEY` | Signs the session cookie — Render generates a random value | `dev-secret-change-me` locally |
+| `SCRIBE_ENV` | Production hardening gate: `production` makes a missing `SECRET_KEY` fatal at startup, marks the session cookie `Secure`, and turns on the `SCRIBE_DATA_DIR` startup warning below | The image sets `SCRIBE_ENV=production`; unset (or any other value) means dev. This is production-opt-in via deploy config — nothing to set for a local run |
+| `SECRET_KEY` | Signs the session cookie | Render generates a random value. **The image no longer bakes in a fallback key** — any other host that deploys this image and forgets to set `SECRET_KEY` while `SCRIBE_ENV=production` fails to start (raises at boot) instead of running with a forgeable key. Only in dev (`SCRIBE_ENV` unset) does the app fall back to `dev-secret-change-me` |
 | `DATABASE_URL` | SQLAlchemy URL | `sqlite:////data/scribe.db` |
 | `ALLOWED_WS_ORIGINS` | Extra allow-listed origins for the collaboration WebSocket (comma-separated) | `http://localhost:5173,http://localhost:8000` |
+
+`SCRIBE_ENV=production` also drives the `SCRIBE_DATA_DIR` startup check (see the
+[Persistence note](#persistence-note-important-and-by-design) above): the resolved absolute
+`yjs.db` path is always logged, and unset/relative paths get a loud warning in production — which
+is why Render free's `SCRIBE_DATA_DIR=/data` (set and writable, just ephemeral) never triggers it.
 
 ## Real-time collaboration and this deploy
 
