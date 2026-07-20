@@ -1,9 +1,11 @@
 """Focused tests for the RoomManager behavior required by the Task 2 review:
 exception observability (a crashed room's background task must not be
 fire-and-forget) and full eviction on the last client's release. Also covers
-the Task 3 review's "Important" finding: get()/release() share ONE global
-lock across every doc_id, and (before the fix below) held it across the
-startup awaits with no timeout -- see test_hung_room_startup_is_bounded... .
+the Task 3 review's "Important" finding -- get()/release() originally shared
+ONE global lock across every doc_id, held across the startup awaits with no
+timeout, see test_hung_room_startup_is_bounded... -- and Phase 7's follow-up
+fix replacing that global lock with a per-doc_id lock pool, see
+test_two_docs_open_concurrently_without_blocking.
 """
 
 import asyncio
@@ -109,26 +111,25 @@ def test_release_evicts_room_on_last_client(tmp_path, monkeypatch):
 def test_hung_room_startup_is_bounded_and_does_not_leak_room_tasks(tmp_path, monkeypatch):
     """Task 3 review, "Important" finding: `get()` awaits the rehydration read
     and both YRoom readiness events (`started`, `ydoc_observed`) while holding
-    `self._lock` -- the ONE lock shared by get()/release() for EVERY doc_id.
-    Before this fix, a room whose startup hangs (or whose background task
-    crashes without ever completing that readiness handshake -- from get()'s
-    point of view, awaiting an Event that will never be set looks identical
-    either way) would hold that lock forever, wedging get()/release() for
-    every other document too, with no way out.
+    a lock for the duration of startup. Before this fix, a room whose startup
+    hangs (or whose background task crashes without ever completing that
+    readiness handshake -- from get()'s point of view, awaiting an Event that
+    will never be set looks identical either way) would hold that lock
+    forever, wedging get()/release() for every other document too, with no
+    way out.
 
     `RoomManager._create_room` now wraps the whole startup sequence in
     `anyio.fail_after(self._startup_timeout)`. This proves two things at
     once:
 
     1. The stall is now BOUNDED, not indefinite: a get() for the hung doc_id
-       fails fast with TimeoutError (instead of hanging forever), which -- by
-       ordinary `async with self._lock:` semantics -- releases the shared
-       lock, so a concurrent get() for a second, completely unrelated doc_id
-       still succeeds well within the same window rather than being wedged
-       behind the first indefinitely. (The two calls are still internally
-       serialized by the single global lock, by design -- see rooms.py's
-       `_create_room` docstring -- so this demonstrates "bounded to a few
-       seconds," not true lock-free concurrency between doc_ids.)
+       fails fast with TimeoutError (instead of hanging forever), releasing
+       its own per-doc_id lock. As of Phase 7's per-doc-lock pool, a hung
+       doc_id no longer blocks an unrelated doc_id AT ALL -- see
+       `test_two_docs_open_concurrently_without_blocking` below for the test
+       that discriminates true concurrency from "merely bounded" -- this test
+       only pins that the hung doc_id's OWN get() call is bounded, not
+       indefinite.
     2. The pre-cache `_room_tasks[doc_id]` leak is fixed: the failed doc_id's
        start() task -- registered in `_room_tasks` before the hang -- does not
        linger there once the timeout fires (previously nothing would ever
@@ -191,6 +192,93 @@ def test_hung_room_startup_is_bounded_and_does_not_leak_room_tasks(tmp_path, mon
         assert "doc-other" in mgr._rooms_by_id
         with anyio.fail_after(5):
             await mgr.release("doc-other")
+
+    anyio.run(scenario)
+    gc.collect()
+
+
+def test_two_docs_open_concurrently_without_blocking(tmp_path, monkeypatch):
+    """Phase 7 per-doc-lock pool: two get() calls for DIFFERENT doc_ids must
+    run concurrently -- while one document's room startup is hung, the other
+    document's get() must return in a small fraction of `startup_timeout`,
+    not merely "before some generous outer bound." A timing bound alone can't
+    discriminate true per-doc concurrency from "still serialized but bounded
+    by the timeout" (that weaker property is all
+    `test_hung_room_startup_is_bounded_and_does_not_leak_room_tasks` above
+    proves). This test is what would go RED against the old single-shared-
+    lock code: there, doc-other would have to wait behind doc-hang for close
+    to the full `startup_timeout` before returning.
+
+    Also pins the lock-then-check no-double-creation guarantee for the SAME
+    doc_id: two concurrent get() calls for one doc_id must share exactly one
+    cached room (`rec.count == 2`), never build two -- proving the per-doc
+    lock still spans the whole check-create-cache sequence the old global
+    lock did.
+    """
+    monkeypatch.chdir(tmp_path)
+
+    real_start = YRoom.start  # capture before patching, so "doc-other" behaves normally
+
+    async def hang_only_doc_hang(self, **kwargs):
+        # `YRoom.start` is a class-level patch (applies to every room the
+        # test creates), so distinguish "doc-hang" from every other doc_id
+        # via the room's own ystore.path (== doc_id, since RoomManager always
+        # constructs `ScribeYStore(path=doc_id)`).
+        if getattr(self.ystore, "path", None) == "doc-hang":
+            await anyio.sleep_forever()
+        else:
+            await real_start(self, **kwargs)
+
+    monkeypatch.setattr(YRoom, "start", hang_only_doc_hang)
+
+    async def scenario():
+        mgr = RoomManager(startup_timeout=1.0)
+        results: dict[str, object] = {}
+
+        async def get_hang():
+            try:
+                await mgr.get("doc-hang")
+            except TimeoutError:
+                results["hang"] = "timeout"
+
+        async def get_other():
+            start = time.monotonic()
+            results["other"] = await mgr.get("doc-other")
+            results["other_elapsed"] = time.monotonic() - start
+
+        with anyio.fail_after(5):  # outer safety net for the test itself, not the assertion below
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(get_hang)
+                tg.start_soon(get_other)
+
+        assert results["hang"] == "timeout"
+        # KEY assertion (the one that discriminates true concurrency): while
+        # doc-hang was still in flight, doc-other returned in a small
+        # fraction of startup_timeout (1.0s) -- not merely "before the outer
+        # 5s test-safety net."
+        assert results["other_elapsed"] < 0.3
+        assert "doc-other" in mgr._rooms_by_id
+        assert "doc-hang" not in mgr._rooms_by_id
+
+        with anyio.fail_after(5):
+            await mgr.release("doc-other")
+
+        # Same-doc_id concurrency: two concurrent get() calls for ONE doc_id
+        # must share exactly one cached room (lock-then-check), never two.
+        async def get_shared():
+            await mgr.get("doc-shared")
+
+        with anyio.fail_after(5):
+            async with anyio.create_task_group() as tg2:
+                tg2.start_soon(get_shared)
+                tg2.start_soon(get_shared)
+
+        assert mgr._rooms_by_id["doc-shared"].count == 2
+
+        with anyio.fail_after(5):
+            await mgr.release("doc-shared")
+        with anyio.fail_after(5):
+            await mgr.release("doc-shared")
 
     anyio.run(scenario)
     gc.collect()
