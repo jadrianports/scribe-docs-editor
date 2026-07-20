@@ -14,7 +14,7 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     DATABASE_URL=sqlite:////data/scribe.db \
     SCRIBE_DATA_DIR=/data \
-    SECRET_KEY=change-me-in-production
+    SCRIBE_ENV=production
 WORKDIR /app
 COPY backend/requirements.txt ./backend/requirements.txt
 RUN pip install --no-cache-dir -r backend/requirements.txt
