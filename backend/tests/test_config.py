@@ -205,3 +205,35 @@ def test_validate_data_dir_references_ystore_db_path_not_rederived():
     source = inspect.getsource(config.validate_data_dir)
     assert "ScribeYStore.db_path" in source
     assert 'os.environ.get("SCRIBE_DATA_DIR"' not in source
+
+
+def test_lifespan_calls_validate_data_dir_before_init_db_and_yield():
+    """main.py's lifespan must call validate_data_dir() as its first
+    statement -- before init_db()/seed() and before yield -- so the
+    resolved data-dir path is the first thing logged at startup and an
+    unwritable dir fails before any DB work runs."""
+    import inspect
+
+    from app import main
+
+    assert main.validate_data_dir is config.validate_data_dir
+
+    source = inspect.getsource(main.lifespan)
+    assert source.index("validate_data_dir()") < source.index("init_db()")
+    assert source.index("validate_data_dir()") < source.index("yield")
+
+
+def test_lifespan_data_dir_check_is_dev_safe(tmp_path, monkeypatch, caplog):
+    """D-14: with SCRIBE_ENV unset and a writable tmp data dir -- the normal
+    local dev run -- the same validate_data_dir() the lifespan calls must
+    neither raise nor warn, confirming the existing `client` fixture's
+    TestClient(app) construction path (dev mode, writable cwd) is
+    unaffected by this preflight."""
+    data_dir = tmp_path / "data"
+    monkeypatch.setattr(ScribeYStore, "db_path", str(data_dir / "yjs.db"))
+    monkeypatch.delenv("SCRIBE_ENV", raising=False)
+
+    with caplog.at_level("INFO"):
+        config.validate_data_dir()  # must not raise
+
+    assert not any(r.levelname == "WARNING" for r in caplog.records)
