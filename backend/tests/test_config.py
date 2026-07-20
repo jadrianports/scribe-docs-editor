@@ -3,6 +3,9 @@ checked directly, not merely exercised through a happy-path assertion.
 """
 
 import pytest
+from fastapi import FastAPI, Request
+from starlette.middleware.sessions import SessionMiddleware
+from starlette.testclient import TestClient
 
 from app import config
 
@@ -57,3 +60,42 @@ def test_resolve_secret_key_dev_uses_set_value(monkeypatch):
     monkeypatch.delenv("SCRIBE_ENV", raising=False)
     monkeypatch.setenv("SECRET_KEY", "dev-custom-key")
     assert config.resolve_secret_key() == "dev-custom-key"
+
+
+def _session_cookie_app():
+    """A minimal in-process app, built the same way main.py builds its
+    SessionMiddleware, so the Set-Cookie header can be inspected without a
+    live_server subprocess (D-14).
+    """
+    app = FastAPI()
+    app.add_middleware(
+        SessionMiddleware,
+        secret_key="x",
+        same_site="lax",
+        https_only=config.is_production(),
+    )
+
+    @app.get("/set")
+    def set_session(request: Request):
+        request.session["k"] = "v"
+        return {"ok": True}
+
+    return app
+
+
+def test_session_cookie_is_secure_and_lax_in_production(monkeypatch):
+    monkeypatch.setenv("SCRIBE_ENV", "production")
+    client = TestClient(_session_cookie_app())
+    response = client.get("/set")
+    set_cookie = response.headers["set-cookie"]
+    assert "secure" in set_cookie.lower()
+    assert "samesite=lax" in set_cookie.lower()
+
+
+def test_session_cookie_omits_secure_in_dev(monkeypatch):
+    monkeypatch.delenv("SCRIBE_ENV", raising=False)
+    client = TestClient(_session_cookie_app())
+    response = client.get("/set")
+    set_cookie = response.headers["set-cookie"]
+    assert "secure" not in set_cookie.lower()
+    assert "samesite=lax" in set_cookie.lower()
