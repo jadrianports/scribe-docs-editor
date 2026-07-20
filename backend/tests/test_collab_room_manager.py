@@ -431,6 +431,26 @@ def test_abandoned_room_subscription_is_not_finalized_on_worker_thread(tmp_path,
     REAL worker thread via `asyncio.to_thread(gc.collect)` -- exactly the condition
     that crashes the unfixed marker.
 
+    SCOPE -- read before trusting this as a regression guard. This is an
+    end-to-end smoke test of the teardown path, NOT a discriminating red/green
+    guard for the cycle fix. Measured: with `_make_dirty_marker` deliberately
+    reverted to the default-argument-capture cycle, this test still passes 5/5
+    runs. That is not a flaw in the assertion -- it is because the scenario
+    calls `release()`, whose Task 2 teardown (unobserve + clear + gc.collect on
+    the event-loop thread) already neutralizes the cycle before the worker
+    thread ever collects. So despite the name, the room here is not truly
+    abandoned; a room that skips `release()` entirely would be needed to make
+    the cycle bite deterministically.
+
+    The invariant is therefore pinned by two other tests that DO fail
+    deterministically against unfixed code, and those are the real guards:
+      - `test_dirty_marker_holds_no_strong_reference_to_record` (the cycle)
+      - `test_release_clears_the_yroom_internal_subscription` (the YRoom handle)
+
+    Kept because it exercises the full seed -> dirty -> release -> worker-thread-GC
+    path end to end and would catch a gross regression in that sequence. Do not
+    cite it as proof the cycle fix works.
+
     Installs a capturing replacement for `sys.unraisablehook` via
     `monkeypatch.setattr` (monkeypatch restores the original automatically).
     pytest's own unraisable plugin hooks the same attribute, so this deliberately
