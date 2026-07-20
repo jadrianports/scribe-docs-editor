@@ -1,4 +1,5 @@
 import os
+import uuid
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, WebSocket
@@ -47,6 +48,21 @@ def _origin_allowed(origin: str | None, host: str | None) -> bool:
     return urlparse(origin).netloc == host
 
 
+def _is_valid_doc_id(doc_id: str) -> bool:
+    """True if `doc_id` parses as a UUID (hyphenated or dashless 32-hex form).
+
+    `Document.id` is always `str(uuid.uuid4())` (app/models.py); this rejects
+    anything else -- empty string, None, path-like or SQL-ish garbage -- before
+    it can be used as a DB lookup key or, further down `collab_ws`, as
+    `ScribeYStore(path=doc_id)`'s room name / store path.
+    """
+    try:
+        uuid.UUID(doc_id)
+    except (ValueError, AttributeError, TypeError):
+        return False
+    return True
+
+
 def _authorize(websocket: WebSocket, doc_id: str) -> str | None:
     """Return the effective role, or None if the connection must be closed."""
     user_id = websocket.session.get("user_id")  # SessionMiddleware populates ws scope
@@ -69,6 +85,14 @@ async def collab_ws(websocket: WebSocket, doc_id: str):
     origin = websocket.headers.get("origin")
     if not _origin_allowed(origin, websocket.headers.get("host")):
         await websocket.close(code=4403)
+        return
+
+    if not _is_valid_doc_id(doc_id):
+        # Same 4404 _authorize's "unknown doc / no relationship" branch uses --
+        # a malformed doc_id must never be distinguishable from an inaccessible
+        # real one (404-not-403 non-leak rule, DEC-access-central). Rejected
+        # here, before _authorize's DB lookup or room_manager.get() ever see it.
+        await websocket.close(code=4404)
         return
 
     role = _authorize(websocket, doc_id)
