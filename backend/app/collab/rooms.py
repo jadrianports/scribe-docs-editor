@@ -16,10 +16,12 @@ from .ystore import ScribeYStore
 log = logging.getLogger(__name__)
 
 # A room's startup (SQLite rehydration + the two YRoom readiness events) runs
-# while `get()` holds the single lock shared by get()/release() for EVERY
-# doc_id (see `_create_room`'s docstring). Bounding it means a hung/crashed
-# startup for one doc_id can only ever stall other doc_ids for "a few
-# seconds," not forever (Task 3 review, "Important" finding).
+# while `get()` holds that doc_id's OWN per-doc_id lock (see `_lock_for` and
+# `_create_room`'s docstring) -- never a lock shared with any other doc_id.
+# Bounding it means a hung/crashed startup for one doc_id can only ever stall
+# get()/release() calls for THAT SAME doc_id for "a few seconds," not forever,
+# and never stalls any other doc_id at all (Task 3 review, "Important"
+# finding; Phase 7 per-doc-lock refactor).
 DEFAULT_STARTUP_TIMEOUT = 5.0
 
 # Bounds release()'s final, already-dirty snapshot persist -- kept separate
@@ -183,8 +185,32 @@ async def _snapshot_ticker(doc_id: str, room: YRoom, record: RoomRecord) -> None
 class RoomManager:
     def __init__(self, startup_timeout: float = DEFAULT_STARTUP_TIMEOUT) -> None:
         self._rooms_by_id: dict[str, RoomRecord] = {}
-        self._lock = Lock()
+        # Per-doc_id lock pool (Phase 7): replaces the single instance-wide
+        # `Lock()` that used to guard get()/release() for EVERY doc_id, so a
+        # hung/slow room startup for one doc_id no longer stalls access to
+        # any other. `_doc_locks_guard` protects ONLY the dict lookup/insert
+        # inside `_lock_for` -- it is never held across an await and never
+        # guards room startup itself. The pool is never evicted (grows for
+        # the process's life, like `_rooms_by_id` already does): evicting a
+        # doc_id's lock while a caller might still be waiting on it would
+        # reintroduce a TOCTOU double-room-creation race.
+        self._doc_locks: dict[str, Lock] = {}
+        self._doc_locks_guard = Lock()
         self._startup_timeout = startup_timeout
+
+    async def _lock_for(self, doc_id: str) -> Lock:
+        """Get-or-create the per-doc_id lock that guards get()/release() for `doc_id`.
+
+        `_doc_locks_guard` is held only for this trivial dict lookup/insert --
+        never across an await -- so looking up one doc_id's lock is never
+        blocked by another doc_id's in-flight room startup.
+        """
+        async with self._doc_locks_guard:
+            lock = self._doc_locks.get(doc_id)
+            if lock is None:
+                lock = Lock()
+                self._doc_locks[doc_id] = lock
+            return lock
 
     def _make_crash_evictor(self, doc_id: str, room: YRoom):
         """Build the done-callback for `room`'s background `start()` task.
@@ -234,7 +260,8 @@ class RoomManager:
         return _on_done
 
     async def get(self, doc_id: str) -> YRoom:
-        async with self._lock:
+        lock = await self._lock_for(doc_id)
+        async with lock:
             rec = self._rooms_by_id.get(doc_id)
             if rec is None:
                 rec = await self._create_room(doc_id)
@@ -245,17 +272,19 @@ class RoomManager:
     async def _create_room(self, doc_id: str) -> RoomRecord:
         """Build and start a fresh room for `doc_id`.
 
-        Called from `get()` while `self._lock` -- the single lock shared by
-        get()/release() for EVERY doc_id -- is held. Before this method
-        existed, `get()` awaited the rehydration read and both YRoom readiness
-        events (`started`, `ydoc_observed`) inline, with no timeout: a room
-        that hung during startup (or whose background task crashed without
-        ever completing that readiness handshake -- from here, an Event that
-        will never be set looks identical either way) would hold the lock
-        forever, wedging get()/release() for every OTHER document too (Task 3
-        review, "Important" finding). `anyio.fail_after` bounds the whole
-        sequence to `self._startup_timeout` seconds, so the worst case becomes
-        "a few seconds," not "forever."
+        Called from `get()` while `doc_id`'s OWN per-doc_id lock (obtained via
+        `_lock_for`) is held -- never a lock shared with any other doc_id.
+        Before the per-doc_id lock pool existed, `get()`/`release()` shared
+        one instance-wide lock across EVERY doc_id, so a room that hung during
+        startup (or whose background task crashed without ever completing the
+        readiness handshake -- from here, an Event that will never be set
+        looks identical either way) would wedge get()/release() for every
+        OTHER document too, not just its own (Task 3 review, "Important"
+        finding; fixed by Phase 7's per-doc-lock refactor). `anyio.fail_after`
+        bounds the whole startup sequence to `self._startup_timeout` seconds,
+        so the worst case for THIS doc_id becomes "a few seconds," not
+        "forever" -- and, independently of the timeout, no other doc_id is
+        ever affected at all.
 
         On any failure -- timeout or a genuine exception (e.g. from SQLite) --
         `self._rooms_by_id` is untouched (this method's return value is only
@@ -332,7 +361,8 @@ class RoomManager:
             raise
 
     async def release(self, doc_id: str) -> bool:
-        async with self._lock:
+        lock = await self._lock_for(doc_id)
+        async with lock:
             rec = self._rooms_by_id.get(doc_id)
             if rec is None:
                 return False
@@ -353,12 +383,14 @@ class RoomManager:
                 # worker thread that might otherwise cross the cyclic-GC
                 # threshold and panic on a still-cyclic, thread-affine
                 # pycrdt Subscription (D-08, D-30). gc.collect() here is a
-                # synchronous full collection inside release()'s single
-                # shared lock (CLAUDE.md), so this adds collection time to
-                # that critical section -- accepted because room teardown is
-                # a rare event (the last client disconnecting) against a
-                # small heap, versus the alternative of a reproducible pycrdt
-                # panic; Phase 7's per-doc lock work should revisit this.
+                # synchronous full collection inside release()'s critical
+                # section -- as of Phase 7, THIS doc_id's own per-doc lock,
+                # not a lock shared with any other doc_id -- so this adds
+                # collection time only to teardown of this one document, not
+                # to any other document's get()/release(); accepted because
+                # room teardown is a rare event (the last client
+                # disconnecting) against a small heap, versus the alternative
+                # of a reproducible pycrdt panic.
                 # With Task 1's cycle already broken, the Subscription itself
                 # is freed by refcounting the instant record's last strong
                 # reference drops -- this collect is defense in depth, to
@@ -414,8 +446,7 @@ class RoomManager:
 
         Takes a shallow, lock-free snapshot of the current rooms
         (`list(self._rooms_by_id.values())`, D-16): this must never become a
-        new caller on `self._lock` -- the shared lock every doc_id serializes
-        through is Phase 7's problem, not this one's -- and a room
+        new caller on any per-doc_id lock from `self._doc_locks` -- and a room
         appearing or vanishing mid-flush (a client connecting/disconnecting
         during shutdown) is harmless here; it just sees a point-in-time list.
 
