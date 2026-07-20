@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import weakref
 from dataclasses import dataclass
 
 from anyio import Lock, fail_after
@@ -41,8 +42,13 @@ class RoomRecord:
     `ydoc.observe` callback flips True on any edit (never a value stored
     inside the Y.Doc itself -- Pitfall 4); `ticker_task` is the per-room
     `_snapshot_ticker` background task; `dirty_subscription` is the
-    `Subscription` handle returned by that `observe` call, kept only so
-    teardown can optionally unobserve it for hygiene.
+    `Subscription` handle returned by that `observe` call. Unobserving and
+    clearing this handle at every teardown site is mandatory, not
+    discretionary hygiene: it drops the record's own strong edge to the
+    Subscription so pycrdt's Rust-backed, thread-affine object is finalized
+    by ordinary refcounting on the event-loop thread that created it, rather
+    than surviving to be swept by CPython's cyclic GC on whatever thread
+    crosses its allocation threshold (D-08, D-30).
     """
 
     doc_id: str
@@ -52,6 +58,37 @@ class RoomRecord:
     dirty: bool = False
     ticker_task: asyncio.Task | None = None
     dirty_subscription: object | None = None
+
+
+def _make_dirty_marker(record: RoomRecord):
+    """Build the `ydoc.observe` callback that flips `record.dirty` True.
+
+    Closes over ONLY a weak reference to `record` -- never the record
+    itself, and never via a parameter whose default value is the record.
+    That default-argument capture form is exactly what created a reference
+    cycle (record -> dirty_subscription -> this callback -> record): plain
+    refcounting can never free a cycle, so only CPython's cyclic GC could
+    reclaim it, and that collector runs on whichever thread crosses its
+    allocation threshold -- including an `asyncio.to_thread` persist worker.
+    pycrdt's Rust-backed `Subscription` panics if finalized off the thread
+    that created it (D-08, D-30), so the cycle had to go, not just be swept
+    fast enough.
+
+    The record is strongly held for its entire live span by two independent
+    owners -- `RoomManager._rooms_by_id[doc_id]` while the room is cached,
+    and the `_snapshot_ticker(doc_id, room, record)` coroutine frame for as
+    long as the ticker task runs. Both outlive any window in which an edit
+    could arrive and need marking, so this weak reference can never be dead
+    while the room is live, and the D-12 dirty-flag contract is preserved.
+    """
+    record_ref = weakref.ref(record)
+
+    def _mark_dirty(event) -> None:
+        rec = record_ref()
+        if rec is not None:
+            rec.dirty = True
+
+    return _mark_dirty
 
 
 async def _snapshot_ticker(doc_id: str, room: YRoom, record: RoomRecord) -> None:
@@ -223,10 +260,7 @@ class RoomManager:
                 # rehydrated room costs zero writes. `record.dirty` is a plain
                 # bool on the record, never a value stored inside the Y.Doc
                 # itself (Pitfall 4).
-                def _mark_dirty(event, _record=record) -> None:
-                    _record.dirty = True
-
-                record.dirty_subscription = room.ydoc.observe(_mark_dirty)
+                record.dirty_subscription = room.ydoc.observe(_make_dirty_marker(record))
                 # One ticker per room, spawned alongside room.start() above --
                 # no global sweeper (D-04).
                 ticker_task = asyncio.create_task(_snapshot_ticker(doc_id, room, record))
