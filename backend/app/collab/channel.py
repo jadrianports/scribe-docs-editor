@@ -42,9 +42,10 @@ class ReadOnlyChannel(StarletteChannel):
                 msg = await self.recv()
             except Exception:
                 raise StopAsyncIteration()
+            if len(msg) < 2:
+                return msg  # too short to carry a type+subtype -- pass through unfiltered, safe
             if (
-                len(msg) > 1
-                and msg[0] == YMessageType.SYNC
+                msg[0] == YMessageType.SYNC
                 and msg[1] in (YSyncMessageType.SYNC_STEP2, YSyncMessageType.SYNC_UPDATE)
             ):
                 continue
