@@ -6,11 +6,12 @@ from fastapi.responses import FileResponse
 from starlette.middleware.sessions import SessionMiddleware
 
 from .collab.rooms import room_manager
+from .config import is_production, resolve_secret_key
 from .db import SessionLocal, init_db
 from .routers import auth, collab, documents, export, shares, upload
 from .seed import seed
 
-SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-change-me")
+SECRET_KEY = resolve_secret_key()
 FRONTEND_DIST = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "..", "frontend", "dist")
 )
@@ -32,7 +33,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Scribe API", lifespan=lifespan)
-app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, same_site="lax", https_only=False)
+app.add_middleware(
+    SessionMiddleware, secret_key=SECRET_KEY, same_site="lax", https_only=is_production()
+)
 
 app.include_router(auth.router, prefix="/api")
 app.include_router(documents.router, prefix="/api")
