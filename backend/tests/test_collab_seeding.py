@@ -65,6 +65,57 @@ def test_convert_smoke_full_schema_round_trip_is_idempotent_on_second_pass():
     gc.collect()
 
 
+def test_convert_bare_li_text_is_wrapped_in_a_paragraph():
+    """A `listItem` must never hold a raw text run.
+
+    TipTap StarterKit's `ListItem` declares `content: "paragraph block*"`,
+    so `<listItem>text</listItem>` is schema-invalid and ProseMirror
+    silently drops the node when the Y.Doc syncs into the editor -- a
+    seeded `<ul><li>a</li></ul>` renders as an empty document, with no
+    error on either side.
+
+    This asserts the **Y.Doc shape directly** rather than only the HTML
+    round-trip, because the round-trip cannot catch this class of bug:
+    `ydoc_to_html` walks the malformed shape straight back to correct
+    `<ul><li>a</li></ul>` HTML, so seeding and the outbound walk stay
+    consistent inverses of each other while the real editor shows nothing.
+    Note `FULL_SCHEMA_HTML` above already uses the canonical
+    `<li><p>..</p></li>` form -- which is exactly why the bare-`<li>` shape
+    (what `sanitize_html` permits, and what `PATCH /documents/{doc_id}` can
+    legitimately store) went uncovered.
+    """
+    doc = Doc()
+    frag = doc.get("default", type=XmlFragment)
+    for node in _html_to_prelim_tree("<ul><li>First</li><li>Second</li></ul>"):
+        _materialize(frag, node)
+
+    assert "<listItem><paragraph>First</paragraph></listItem>" in str(frag)
+    assert "<listItem>First</listItem>" not in str(frag)
+    gc.collect()
+
+
+def test_convert_list_item_shapes_normalize_to_the_same_canonical_ydoc():
+    """Bare `<li>a</li>` and canonical `<li><p>a</p></li>` must converge on
+    one Y.Doc shape, so re-seeding a document from `content_html` that the
+    outbound walk itself produced is a no-op rather than a second, subtly
+    different tree. Nested block children (a sublist) stay siblings of the
+    wrapping paragraph, matching `paragraph block*`.
+    """
+
+    def to_xml(html: str) -> str:
+        doc = Doc()
+        frag = doc.get("default", type=XmlFragment)
+        for node in _html_to_prelim_tree(html):
+            _materialize(frag, node)
+        return str(frag)
+
+    assert to_xml("<ul><li>a</li></ul>") == to_xml("<ul><li><p>a</p></li></ul>")
+
+    nested = to_xml("<ul><li>Parent<ul><li>Child</li></ul></li></ul>")
+    assert "<listItem><paragraph>Parent</paragraph><bulletList>" in nested
+    gc.collect()
+
+
 def test_convert_skips_comment_and_processing_instruction_nodes():
     """WR-04 regression: a leading (or inline) HTML comment or processing
     instruction must never be read as visible text. `sanitize_html`

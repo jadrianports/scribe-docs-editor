@@ -251,6 +251,64 @@ def _walk_children(el) -> list["_PrelimElement | _PrelimText"]:
     return out
 
 
+def _is_inline_prelim(node: "_PrelimElement | _PrelimText") -> bool:
+    """True if `node` is inline content that cannot stand alone as a
+    `listItem` child. Mirrors html.py's `_is_inline_safe` in reverse: only
+    text runs and `hardBreak` are inline; every other prelim element is a
+    block node.
+    """
+    return isinstance(node, _PrelimText) or node.tag == "hardBreak"
+
+
+def _normalize_list_item_children(
+    children: list["_PrelimElement | _PrelimText"],
+) -> list["_PrelimElement | _PrelimText"]:
+    """Wrap a `listItem`'s inline content in a `paragraph` so the node
+    satisfies ProseMirror's content spec for list items.
+
+    Unlike `paragraph`/`heading` -- textblocks that legitimately hold text
+    directly -- TipTap StarterKit's `ListItem` declares `content:
+    "paragraph block*"`. A `listItem` holding a raw text run is therefore
+    schema-invalid, and ProseMirror **silently drops the whole node** when
+    the Y.Doc syncs into the editor: a seeded `<ul><li>a</li></ul>` renders
+    as nothing at all, with no error on either side.
+
+    That failure is invisible to a backend-only round-trip test, because
+    html.py's `ydoc_to_html` happily walks the malformed shape back to
+    correct `<ul><li>a</li></ul>` HTML -- the two halves stay consistent
+    inverses of each other while the real editor shows an empty document.
+    Hence this normalization lives here, at the one place that builds
+    `listItem` nodes, and `test_collab_seeding.py` asserts the resulting
+    shape directly rather than only asserting the HTML round-trip.
+
+    Consecutive inline nodes collapse into one paragraph; block children
+    (a nested `bulletList`, an explicit `<li><p>...</p></li>`) pass through
+    untouched. A leading block child still gets an empty paragraph in front
+    of it, since the spec requires the *first* child to be a paragraph.
+    """
+    normalized: list[_PrelimElement | _PrelimText] = []
+    run: list[_PrelimElement | _PrelimText] = []
+
+    def flush_run() -> None:
+        if run:
+            normalized.append(_PrelimElement("paragraph", {}, list(run)))
+            run.clear()
+
+    for child in children:
+        if _is_inline_prelim(child):
+            run.append(child)
+        else:
+            flush_run()
+            normalized.append(child)
+    flush_run()
+
+    if not normalized or (
+        isinstance(normalized[0], _PrelimElement) and normalized[0].tag != "paragraph"
+    ):
+        normalized.insert(0, _PrelimElement("paragraph", {}))
+    return normalized
+
+
 def _convert_block_element(el) -> _PrelimElement:
     """Convert one block-level lxml element to a prelim block node -- the
     inverse of html.py's `_element_html` (D-01/D-03)."""
@@ -260,7 +318,10 @@ def _convert_block_element(el) -> _PrelimElement:
         level = _LEVEL_TO_HEADING.get(el.tag, 1)
         return _PrelimElement("heading", {"level": level}, _walk_children(el))
     node_tag = _TAG_TO_BLOCK.get(el.tag, "paragraph")  # D-03: unknown element -> paragraph
-    return _PrelimElement(node_tag, {}, _walk_children(el))
+    children = _walk_children(el)
+    if node_tag == "listItem":
+        children = _normalize_list_item_children(children)
+    return _PrelimElement(node_tag, {}, children)
 
 
 def _convert_block_siblings(elements) -> list[_PrelimElement]:
