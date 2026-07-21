@@ -65,6 +65,30 @@ def test_convert_smoke_full_schema_round_trip_is_idempotent_on_second_pass():
     gc.collect()
 
 
+def test_convert_skips_comment_and_processing_instruction_nodes():
+    """WR-04 regression: a leading (or inline) HTML comment or processing
+    instruction must never be read as visible text. `sanitize_html`
+    (bleach, `strip=True`) already strips these before `content_html` is
+    ever stored through the app's own write path, so this exercises the
+    converter directly (`_html_to_prelim_tree`), the same way the module's
+    own module docstring frames this as "not reachable today, but a real
+    gap in a converter with no compiler-enforced round-trip guarantee."
+    """
+    doc = Doc()
+    frag = doc.get("default", type=XmlFragment)
+    for node in _html_to_prelim_tree("<!-- injected comment text --><p>real</p>"):
+        _materialize(frag, node)
+    assert ydoc_to_html(doc) == "<p>real</p>"
+    gc.collect()
+
+    doc2 = Doc()
+    frag2 = doc2.get("default", type=XmlFragment)
+    for node in _html_to_prelim_tree("<p>before <!-- c -->after</p>"):
+        _materialize(frag2, node)
+    assert ydoc_to_html(doc2) == "<p>before after</p>"
+    gc.collect()
+
+
 def test_idempotent_seed_room_second_call_is_a_noop(tmp_path, monkeypatch, db_session, seed_users):
     """D-18b: calling `seed_room` twice on the same `ydoc` is a no-op the
     second time -- the first call seeds and flips `config.seeded`, the

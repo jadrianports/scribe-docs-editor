@@ -57,6 +57,7 @@ import logging
 from dataclasses import dataclass, field
 
 from lxml import html as lxml_html
+from lxml.etree import _Comment, _ProcessingInstruction
 from pycrdt import Doc, Map, XmlElement, XmlFragment, XmlText
 
 from ..db import SessionLocal
@@ -165,6 +166,28 @@ def _is_block_tag(tag: str) -> bool:
     return tag in _HEADING_HTML_TAGS or tag in _BLOCK_HTML_TAGS
 
 
+def _is_real_element(node) -> bool:
+    """False for a comment or processing-instruction node (WR-04); True for
+    a genuine HTML element.
+
+    `lxml_html.fragments_fromstring` hands comment/PI nodes back alongside
+    real elements wherever they appear -- as top-level siblings
+    (`_convert_block_siblings`) or as children while walking `.text`/`.tail`
+    (`_walk_children`'s `walk_inline`) -- and neither `.tag` (a factory
+    function, not a string, for these node kinds) nor any lookup keyed on it
+    raises for one. Without this check, a comment/PI's `.tag` falls through
+    every tag-dispatch to the "unknown -> paragraph"/"unknown inline ->
+    text" default, and its raw `.text` gets read as if it were real content
+    -- silently injecting e.g. an HTML comment's text into the document.
+    Not reachable through any current write path (`sanitize_html`/bleach,
+    `strip=True`, strips comments before `content_html` is ever stored), but
+    a real gap in a converter with "no compiler-enforced round-trip
+    guarantee" (CLAUDE.md) against any future write path that stores
+    `content_html` without going through `sanitize_html`.
+    """
+    return not isinstance(node, (_Comment, _ProcessingInstruction))
+
+
 def _walk_children(el) -> list["_PrelimElement | _PrelimText"]:
     """Walk `el`'s child nodes (lxml's `.text`/`.tail` model) building the
     list of prelim children for one container -- the single traversal used
@@ -200,6 +223,13 @@ def _walk_children(el) -> list["_PrelimElement | _PrelimText"]:
         if node.text:
             runs.append((node.text, {mark: {} for mark in active_marks}))
         for child in node:
+            if not _is_real_element(child):
+                # WR-04: skip a comment/PI node's own "content" entirely --
+                # never descend into it or read its .text -- but its .tail
+                # (real surrounding text) is still genuine content to keep.
+                if child.tail:
+                    runs.append((child.tail, {m: {} for m in active_marks}))
+                continue
             mark = _TAG_TO_MARK.get(child.tag)
             if mark is not None:
                 walk_inline(child, active_marks + (mark,))
@@ -246,6 +276,11 @@ def _convert_block_siblings(elements) -> list[_PrelimElement]:
     from lxml as a bare string rather than raising. It gets the exact same
     treatment as orphaned tail text below: wrapped in its own paragraph if
     non-whitespace, dropped if whitespace-only.
+
+    A top-level element may also be a comment/PI node (WR-04) -- skipped
+    entirely (never converted, unlike a real element), but its `.tail` (real
+    surrounding text) still gets the same tail-wrapping treatment as any
+    other top-level sibling's tail.
     """
     blocks: list[_PrelimElement] = []
     for el in elements:
@@ -253,7 +288,8 @@ def _convert_block_siblings(elements) -> list[_PrelimElement]:
             if el.strip():
                 blocks.append(_PrelimElement("paragraph", {}, [_PrelimText([(el, {})])]))
             continue
-        blocks.append(_convert_block_element(el))
+        if _is_real_element(el):
+            blocks.append(_convert_block_element(el))
         tail = el.tail
         if tail and tail.strip():
             blocks.append(_PrelimElement("paragraph", {}, [_PrelimText([(tail, {})])]))
