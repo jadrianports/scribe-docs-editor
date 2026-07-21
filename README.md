@@ -152,11 +152,13 @@ the single port.)
 
 ## Running the tests
 
-**Backend** — 46 tests covering access control (viewer-vs-editor, non-collaborator
-404-not-403), upload conversion + sanitization, Markdown export, auth, and real-time
+**Backend** — 84 tests covering access control (viewer-vs-editor, non-collaborator
+404-not-403), upload conversion + sanitization, Markdown export, auth, real-time
 collaboration (WebSocket auth/origin/access checks, CRDT convergence across
 concurrent clients, Yjs→HTML derivation including sanitizer-stability, and SQLite
-persistence across room restarts):
+persistence across room restarts), periodic snapshot durability and recovery,
+per-document room-lock concurrency, and deploy/session hardening (fail-loud
+`SECRET_KEY`, secure cookies, data-dir preflight):
 
 ```bash
 cd backend
@@ -164,14 +166,33 @@ source .venv/bin/activate           # Windows: .venv\Scripts\activate
 pytest -v
 ```
 
-**Frontend** — unchanged by this feature: still 3 unit tests for the permission
-logic, plus a clean `tsc --noEmit`. Collaboration is exercised by the backend's
-real-socket tests above and by manual two-browser verification, not new frontend
-unit tests:
+**Frontend** — 9 test files (43 passed, 1 expected `it.fails` reproduction; 44
+cases total), plus a clean `tsc --noEmit`. Beyond the original permission-logic
+tests (`lib/permissions.test.ts`), this now covers the collaboration and UI paths
+that used to be exercised only by the backend's real-socket tests and manual
+two-browser verification: `useCollab`'s connection lifecycle, status/WS-URL
+mapping, awareness subscription/teardown and StrictMode guard
+(`hooks/useCollab.test.ts`); `EditorPage`'s seed-on-mount for a brand-new and a
+reopened document, the mutation-validated React key on `conn.doc.guid`, the
+`immediatelyRender` contract, and flush-on-unmount (`pages/EditorPage.test.tsx`);
+the Toolbar's active-mark state and its load-bearing transaction-subscription
+regression guard (`components/Toolbar.test.tsx`); `DashboardPage`'s owned/shared
+split, empty states, create, upload (including 413/415 rendering), and navigation
+(`pages/DashboardPage.test.tsx`); `ShareModal`'s role select, share list, and
+revoke/error rendering, and `ExportMenu`'s Markdown/PDF selection
+(`components/ShareModal.test.tsx`, `components/ExportMenu.test.tsx`); and
+`useAutosave`'s debounce coalescing, error re-queue, and Ctrl/Cmd-S flush plus the
+`api.ts` wrapper's 204/non-JSON/`ApiError` branches (`hooks/useAutosave.test.ts`,
+`api.test.ts`). One case is deliberately red-but-documented: `EditorPage.test.tsx`
+reproduces a genuine multi-client seed-race data-corruption bug (see [Known
+limitations](#known-limitations-stated-honestly)) as an `it.fails(...)` case rather than hiding or
+skipping it — it stays visible until the fix, tracked as its own roadmap item,
+lands.
 
 ```bash
 cd frontend
 npm test
+npx tsc --noEmit
 ```
 
 ---
@@ -246,7 +267,8 @@ two real bugs it caught that the unit tests could not).
 - Access control enforced **server-side** (viewers can't edit; non-collaborators get 404)
 - Markdown + PDF export
 - Persistence across refresh and restarts (SQLite volume locally)
-- Automated tests (46 backend + 3 frontend), clean `tsc --noEmit`, one-command Docker run
+- Automated tests (84 backend + 9 frontend test files), clean `tsc --noEmit`,
+  one-command Docker run
 - **Deploy-ready** as a single service — one-click Render Blueprint
   ([`render.yaml`](render.yaml) + [`DEPLOY.md`](DEPLOY.md)); delivered local-first (not
   currently hosted)
