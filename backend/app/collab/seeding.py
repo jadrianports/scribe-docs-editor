@@ -3,9 +3,20 @@
 Owns the whole seeding concern for a room: the should-we-seed gate, the DB
 read of the document's last-saved `content_html`, the HTML->CRDT conversion,
 and the `config.seeded` write. `rooms.py`'s `_create_room` calls
-`seed_room(doc_id, ydoc)` once, after `ydoc_observed.wait()` and before the
-dirty-subscription is registered (D-08, plan 10-05) -- under the same
-per-doc_id lock that makes this exactly-once by construction.
+`await seed_room(doc_id, ydoc)` once, after `ydoc_observed.wait()` and
+before the dirty-subscription is registered (D-08, plan 10-05) -- under the
+same per-doc_id lock that makes this exactly-once by construction.
+
+WR-02: `seed_room` is `async` so its DB read and CPU-bound lxml parse (both
+off-doc, thread-safe -- see `_read_and_convert`) can be offloaded to a
+worker thread via `asyncio.to_thread`, the same pattern `rooms.py` already
+uses for its persist calls. Without this, a slow SQLite read or a large
+document's parse would run directly on the event loop, inside `_create_room`'s
+startup critical section -- stalling every OTHER doc_id's `get()`/`release()`
+and WS message pumping for the duration, not just this one's. Only the
+doc-mutating half (the transaction/materialize/config-flip) stays on the
+event-loop thread, since pycrdt objects are thread-affine and must only ever
+be touched from the thread that owns them.
 
 `html.py`'s outbound walk (`ydoc_to_html`) *is* the spec for this inbound
 converter (D-01): its tag/mark/heading tables are imported and inverted at
@@ -41,6 +52,7 @@ integration, from an already-fully-computed, already-validated
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 
@@ -257,6 +269,24 @@ def _html_to_prelim_tree(raw_html: str) -> list[_PrelimElement]:
     return _convert_block_siblings(_parse_fragment(raw_html))
 
 
+def _read_and_convert(doc_id: str) -> list[_PrelimElement] | None:
+    """The whole off-doc, thread-safe half of the seed (WR-02): the SQLite
+    read (`_read_content_html`) and the CPU-bound lxml parse/build
+    (`_html_to_prelim_tree`), run together so `seed_room` can offload both
+    to one worker thread via a single `asyncio.to_thread` call. Touches no
+    pycrdt object -- safe to run on any thread.
+
+    Returns None if the document row is gone (mirrors `seed_room`'s own
+    no-op posture for that case); raises on a genuine conversion failure,
+    which `seed_room` catches back on the event-loop thread the same way it
+    always has.
+    """
+    raw_html = _read_content_html(doc_id)
+    if raw_html is None:
+        return None
+    return _html_to_prelim_tree(raw_html)
+
+
 def _materialize(container, node: "_PrelimElement | _PrelimText") -> None:
     """Integrate one off-doc prelim node into `container` (an already-
     integrated `XmlFragment` or `XmlElement`) -- the only doc-touching half
@@ -277,7 +307,7 @@ def _materialize(container, node: "_PrelimElement | _PrelimText") -> None:
         _materialize(element, child)
 
 
-def seed_room(doc_id: str, ydoc: Doc) -> None:
+async def seed_room(doc_id: str, ydoc: Doc) -> None:
     """Seed `ydoc`'s "default" fragment from `doc_id`'s last-saved
     `content_html`, exactly once.
 
@@ -305,16 +335,21 @@ def seed_room(doc_id: str, ydoc: Doc) -> None:
     (still uncaught here by design, per this function's own materialize
     section never being wrapped in try/except) -- it only makes the
     following retry's behavior safe.
+
+    WR-02: the DB read and lxml parse (`_read_and_convert`) are offloaded to
+    a worker thread via `asyncio.to_thread` -- neither touches `ydoc`, so
+    this is safe off the event-loop thread. Only the doc-mutating half below
+    (the transaction/materialize/config-flip) stays on the thread that owns
+    `ydoc`, since pycrdt objects are thread-affine.
     """
     if _already_seeded(ydoc):
         return
-    raw_html = _read_content_html(doc_id)
-    if raw_html is None:
-        return
     try:
-        built_children = _html_to_prelim_tree(raw_html)
+        built_children = await asyncio.to_thread(_read_and_convert, doc_id)
     except Exception:
         log.error("seed conversion failed for doc %r", doc_id, exc_info=True)
+        return
+    if built_children is None:  # document row gone (deleted out from under a live room)
         return
     with ydoc.transaction():
         frag = ydoc.get("default", type=XmlFragment)

@@ -339,8 +339,14 @@ class RoomManager:
                 # seed_room already swallows its own exceptions (D-12), so it
                 # is deliberately not wrapped in an additional try/except
                 # here -- the except BaseException below is for genuinely
-                # fatal startup failures, not seed failures.
-                seeding.seed_room(doc_id, room.ydoc)
+                # fatal startup failures, not seed failures. WR-02: seed_room
+                # is async -- it offloads its DB read + lxml parse to a
+                # worker thread (asyncio.to_thread) so a slow read or a large
+                # document's parse never blocks any OTHER doc_id's
+                # get()/release() or WS message pumping; only its
+                # doc-mutating transaction/materialize stays on this
+                # (event-loop) thread, since pycrdt objects are thread-affine.
+                await seeding.seed_room(doc_id, room.ydoc)
 
                 record = RoomRecord(doc_id=doc_id, room=room, start_task=task)
                 # The ticker's own dirty-flag subscription is registered only

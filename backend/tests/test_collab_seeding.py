@@ -70,6 +70,10 @@ def test_idempotent_seed_room_second_call_is_a_noop(tmp_path, monkeypatch, db_se
     second time -- the first call seeds and flips `config.seeded`, the
     second returns immediately via the D-09 gate without touching the
     fragment again (no duplication, no second insert).
+
+    `seed_room` is `async` (WR-02: its DB read + parse are offloaded via
+    `asyncio.to_thread`), so both calls run inside an `anyio.run` scenario,
+    matching this suite's existing convention for exercising async code.
     """
     monkeypatch.chdir(tmp_path)
     doc_row = Document(
@@ -79,17 +83,21 @@ def test_idempotent_seed_room_second_call_is_a_noop(tmp_path, monkeypatch, db_se
     db_session.commit()
 
     ydoc = Doc()
-    seed_room("seed-1", ydoc)
-    frag = ydoc.get("default", type=XmlFragment)
-    first_pass_html = ydoc_to_html(ydoc)
-    assert _already_seeded(ydoc) is True
-    assert first_pass_html == "<p>hello</p>"
-    assert len(frag.children) == 1
 
-    seed_room("seed-1", ydoc)  # second call -- must be a no-op (D-18b)
+    async def scenario():
+        await seed_room("seed-1", ydoc)
+        frag = ydoc.get("default", type=XmlFragment)
+        first_pass_html = ydoc_to_html(ydoc)
+        assert _already_seeded(ydoc) is True
+        assert first_pass_html == "<p>hello</p>"
+        assert len(frag.children) == 1
 
-    assert ydoc_to_html(ydoc) == first_pass_html
-    assert len(frag.children) == 1
+        await seed_room("seed-1", ydoc)  # second call -- must be a no-op (D-18b)
+
+        assert ydoc_to_html(ydoc) == first_pass_html
+        assert len(frag.children) == 1
+
+    anyio.run(scenario)
     gc.collect()
 
 
@@ -104,6 +112,9 @@ def test_seed_room_wraps_leading_bare_text_instead_of_failing_permanently(
     failure (`config.seeded` could never become true for that document).
     The leading text must instead be wrapped in its own paragraph, the same
     treatment already given to orphaned tail text (D-03).
+
+    `seed_room` is `async` (WR-02), so this runs inside an `anyio.run`
+    scenario, matching this suite's existing convention.
     """
     monkeypatch.chdir(tmp_path)
     doc_row = Document(
@@ -116,7 +127,11 @@ def test_seed_room_wraps_leading_bare_text_instead_of_failing_permanently(
     db_session.commit()
 
     ydoc = Doc()
-    seed_room("seed-bare-1", ydoc)
+
+    async def scenario():
+        await seed_room("seed-bare-1", ydoc)
+
+    anyio.run(scenario)
 
     assert _already_seeded(ydoc) is True
     assert ydoc_to_html(ydoc) == "<p>hello </p><p>world</p>"
@@ -135,6 +150,9 @@ def test_seed_room_retry_after_materialize_failure_does_not_duplicate_content(
     already non-empty, skip re-materializing on top of it (which would
     duplicate content), and still flip `config.seeded` true so the room
     isn't stuck retrying forever.
+
+    `seed_room` is `async` (WR-02), so both calls run inside `anyio.run`
+    scenarios, matching this suite's existing convention.
     """
     monkeypatch.chdir(tmp_path)
     doc_row = Document(
@@ -158,15 +176,22 @@ def test_seed_room_retry_after_materialize_failure_does_not_duplicate_content(
 
     monkeypatch.setattr(collab_seeding, "_materialize", _flaky_materialize)
 
+    async def first_attempt():
+        await seed_room("seed-retry-1", ydoc)
+
     with pytest.raises(RuntimeError):
-        seed_room("seed-retry-1", ydoc)
+        anyio.run(first_attempt)
 
     frag = ydoc.get("default", type=XmlFragment)
     assert _already_seeded(ydoc) is False
     assert len(frag.children) == 1  # exactly the one child that landed before the raise
 
     monkeypatch.setattr(collab_seeding, "_materialize", real_materialize)
-    seed_room("seed-retry-1", ydoc)  # retry -- must not duplicate the partial leftover
+
+    async def retry():
+        await seed_room("seed-retry-1", ydoc)  # must not duplicate the partial leftover
+
+    anyio.run(retry)
 
     assert _already_seeded(ydoc) is True
     assert len(frag.children) == 1  # unchanged: retry skipped re-materializing
@@ -183,6 +208,10 @@ def test_failure_seed_room_leaves_fragment_exactly_empty_and_seeded_false(
     off-doc, fallible half) so the failure is injected before any doc
     mutation could occur, proving the two-phase build never partially
     commits on exception.
+
+    `seed_room` is `async` (WR-02: its DB read + parse are offloaded via
+    `asyncio.to_thread`), so this runs inside an `anyio.run` scenario,
+    matching this suite's existing convention.
     """
     monkeypatch.chdir(tmp_path)
     doc_row = Document(
@@ -200,7 +229,11 @@ def test_failure_seed_room_leaves_fragment_exactly_empty_and_seeded_false(
     monkeypatch.setattr(collab_seeding, "_html_to_prelim_tree", _boom)
 
     ydoc = Doc()
-    seed_room("seed-fail-1", ydoc)
+
+    async def scenario():
+        await seed_room("seed-fail-1", ydoc)
+
+    anyio.run(scenario)
 
     assert _already_seeded(ydoc) is False
     frag = ydoc.get("default", type=XmlFragment)
