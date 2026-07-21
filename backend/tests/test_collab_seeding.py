@@ -11,9 +11,11 @@ round-trip through a real room (D-19) land in plan 10-05, once
 import gc
 
 from pycrdt import Doc, XmlFragment
+from app.collab import seeding as collab_seeding
 from app.collab.html import ydoc_to_html
-from app.collab.seeding import _html_to_prelim_tree, _materialize
+from app.collab.seeding import _already_seeded, _html_to_prelim_tree, _materialize, seed_room
 from app.content import sanitize_html
+from app.models import Document
 
 # A single string exercising every tag in content.ALLOWED_TAGS (p, br, strong,
 # em, u, s, h1-h3, ul, ol, li, blockquote) -- mirrors test_collab_html.py's own
@@ -56,4 +58,71 @@ def test_convert_smoke_full_schema_round_trip_is_idempotent_on_second_pass():
 
     result = sanitize_html(ydoc_to_html(doc))
     assert result == sanitize_html(FULL_SCHEMA_HTML)
+    gc.collect()
+
+
+def test_idempotent_seed_room_second_call_is_a_noop(tmp_path, monkeypatch, db_session, seed_users):
+    """D-18b: calling `seed_room` twice on the same `ydoc` is a no-op the
+    second time -- the first call seeds and flips `config.seeded`, the
+    second returns immediately via the D-09 gate without touching the
+    fragment again (no duplication, no second insert).
+    """
+    monkeypatch.chdir(tmp_path)
+    doc_row = Document(
+        id="seed-1", title="T", content_html="<p>hello</p>", owner_id=seed_users["alice"].id
+    )
+    db_session.add(doc_row)
+    db_session.commit()
+
+    ydoc = Doc()
+    seed_room("seed-1", ydoc)
+    frag = ydoc.get("default", type=XmlFragment)
+    first_pass_html = ydoc_to_html(ydoc)
+    assert _already_seeded(ydoc) is True
+    assert first_pass_html == "<p>hello</p>"
+    assert len(frag.children) == 1
+
+    seed_room("seed-1", ydoc)  # second call -- must be a no-op (D-18b)
+
+    assert ydoc_to_html(ydoc) == first_pass_html
+    assert len(frag.children) == 1
+    gc.collect()
+
+
+def test_failure_seed_room_leaves_fragment_exactly_empty_and_seeded_false(
+    tmp_path, monkeypatch, db_session, seed_users
+):
+    """D-20: force `seed_room`'s converter to fail; afterwards `config.seeded`
+    is false, the 'default' fragment is EXACTLY empty (`len(frag.children) ==
+    0`, not merely "fewer than expected" -- Pitfall 1), and the DB
+    `content_html` row is untouched. Patches `_html_to_prelim_tree` (the
+    off-doc, fallible half) so the failure is injected before any doc
+    mutation could occur, proving the two-phase build never partially
+    commits on exception.
+    """
+    monkeypatch.chdir(tmp_path)
+    doc_row = Document(
+        id="seed-fail-1",
+        title="T",
+        content_html="<p>real content</p>",
+        owner_id=seed_users["alice"].id,
+    )
+    db_session.add(doc_row)
+    db_session.commit()
+
+    def _boom(raw_html):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(collab_seeding, "_html_to_prelim_tree", _boom)
+
+    ydoc = Doc()
+    seed_room("seed-fail-1", ydoc)
+
+    assert _already_seeded(ydoc) is False
+    frag = ydoc.get("default", type=XmlFragment)
+    assert len(frag.children) == 0
+
+    db_session.expire_all()  # seed_room reads via its own SessionLocal
+    saved = db_session.get(Document, "seed-fail-1")
+    assert saved.content_html == "<p>real content</p>"
     gc.collect()

@@ -4,6 +4,7 @@ from sqlalchemy.orm import sessionmaker
 from starlette.testclient import TestClient
 
 from app.auth import hash_password
+from app.collab import seeding as collab_seeding
 from app.collab import snapshot as collab_snapshot
 from app.db import get_db
 from app.main import app
@@ -45,6 +46,14 @@ def db_session(tmp_path, monkeypatch):
     # doc_id, and no-op -- passing or failing for the wrong reason instead of
     # exercising the real write path.
     monkeypatch.setattr(collab_snapshot, "SessionLocal", TestingSessionLocal)
+    # Same trap, same fix, a third time: `seed_room` (Phase 10, D-13) does its
+    # own `from ..db import SessionLocal` + `SessionLocal()` read of
+    # `content_html` -- it has no request-scoped session to accept either
+    # (it runs inside `_create_room`'s per-doc-lock critical section, not an
+    # HTTP request). Left unpatched, its unpatched SessionLocal() would
+    # resolve against the real backend/data/scribe.db the same way the two
+    # callers above did before their own redirects landed.
+    monkeypatch.setattr(collab_seeding, "SessionLocal", TestingSessionLocal)
     session = TestingSessionLocal()
     try:
         yield session

@@ -124,9 +124,10 @@ def _already_seeded(ydoc: Doc) -> bool:
 def _parse_fragment(raw_html: str):
     """Parse `raw_html` leniently (D-02).
 
-    NEVER `lxml.etree` (Pitfall 2): `content_html` has un-self-closed void
-    tags (`<br>`) and multiple top-level sibling elements, both of which
-    violate well-formed-XML requirements `lxml.etree` enforces.
+    NEVER use lxml's strict-XML parsing submodule for this (Pitfall 2):
+    `content_html` has un-self-closed void tags (`<br>`) and multiple
+    top-level sibling elements, both of which violate the well-formed-XML
+    requirements that submodule enforces.
     `no_leading_text=True` raises on genuine top-level leading text --
     `content_html` (bleach-sanitized, always block-wrapped) should never
     start with bare text, so that shape is a parse failure worth surfacing
