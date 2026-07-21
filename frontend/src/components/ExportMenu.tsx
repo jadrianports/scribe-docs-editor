@@ -15,7 +15,18 @@ export function ExportMenu({ docId }: { docId: string }) {
   }, [])
 
   const exportMarkdown = () => {
-    window.location.href = `/api/documents/${docId}/export?format=md`
+    // A real same-origin download anchor, not a window.location.href
+    // assignment -- carries the session cookie the same way, but is
+    // testable without stubbing jsdom navigation. The `download` attribute
+    // is intentionally bare (no filename): for a same-origin response the
+    // server's Content-Disposition header (backend/app/routers/export.py)
+    // is authoritative and silently overrides any filename given here.
+    const a = document.createElement('a')
+    a.href = `/api/documents/${docId}/export?format=md`
+    a.download = ''
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
     setOpen(false)
   }
   const exportPdf = () => {
