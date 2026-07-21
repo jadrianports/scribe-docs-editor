@@ -43,25 +43,28 @@ def derive_snapshot_html(ydoc: Doc) -> str | None:
 
     CRITICAL guard (final whole-branch review): also silently no-ops if
     `ydoc` was never *seeded*. A brand-new/never-collaborated document's Y.Doc
-    starts with an empty "default" XmlFragment, and it STAYS empty until the
-    first TipTap client's seed effect (`frontend/src/pages/EditorPage.tsx`)
-    inserts the document's last-saved `content_html` into it -- a one-time
-    action guarded by a flag in a shared `config` map so N simultaneous
-    openers never double-insert:
-    `ydoc.getMap('config').set('seeded', true)` (JS/Yjs side). A room can
-    empty -- triggering this function via `RoomManager.release()` -- before
-    that guard is ever flipped: e.g. a viewer opens a never-collaborated
-    document and leaves before any editor connects, or a client only ever
-    touches an unrelated root key (both exercised in
-    `backend/tests/test_collab_persistence.py` and
-    `backend/tests/test_collab_access.py`). Without this guard,
+    starts with an empty "default" XmlFragment, and it STAYS empty until
+    `RoomManager._create_room` calls `seed_room` (`backend/app/collab/
+    seeding.py`) exactly once, server-side, before any client connects,
+    flipping `ydoc.getMap(CONFIG_MAP_NAME).set(SEEDED_KEY, True)` -- a
+    one-time action guarded by that same flag so N simultaneous openers
+    never double-insert (`seed_room`'s own D-09 gate). The client has no
+    seeding logic of its own (Phase 10 removed `EditorPage.tsx`'s seed
+    effect entirely; it is a pure Y.Doc consumer now). A room can empty --
+    triggering this function via `RoomManager.release()` -- before that
+    guard is ever flipped: e.g. the document row was deleted out from under
+    a live room (`seed_room` no-ops if the row is gone) or a seed
+    conversion failure left `config.seeded` false (D-12/D-20) (both
+    exercised in `backend/tests/test_collab_persistence.py` and
+    `backend/tests/test_collab_seeding.py`). Without this guard,
     `ydoc_to_html(ydoc)` returns "" for such a ydoc, and it was written
     unconditionally -- silently overwriting real, previously-saved content
-    with nothing the instant such a room emptied. Mirrors the client's own
-    flag (same map name "config", same key "seeded") rather than e.g.
-    inferring "seeded" from whether "default" has children, so this stays in
-    sync with whatever "seeded" means client-side by construction, not by
-    separately guessing/reimplementing that contract server-side.
+    with nothing the instant such a room emptied. Reads the same map name/
+    key `seed_room` writes (imported from `.seeding` as `CONFIG_MAP_NAME`/
+    `SEEDED_KEY`, D-23) rather than e.g. inferring "seeded" from whether
+    "default" has children, so this stays in sync with whatever "seeded"
+    means by construction, not by separately guessing/reimplementing that
+    contract.
     """
     if not ydoc.get(CONFIG_MAP_NAME, type=Map).get(SEEDED_KEY):
         return None
