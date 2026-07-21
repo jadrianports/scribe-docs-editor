@@ -28,6 +28,7 @@ import * as Y from 'yjs'
 import { renderWithProviders, screen } from '../test/renderWithProviders'
 import { makeConnection, sync } from '../test/collabHarness'
 import type { TestCollabConnection } from '../test/collabHarness'
+import { createManualRelay } from '../test/relayPump'
 import { FULL_SCHEMA_HTML } from '../test/fullSchemaFixture'
 import { EditorPage } from './EditorPage'
 import { api } from '../api'
@@ -222,6 +223,83 @@ describe('EditorPage', () => {
       // empty as it started, never gaining a copy of FULL_SCHEMA_HTML.
       expect(conn.doc.getXmlFragment('default').toString()).toBe('')
       expect(conn.doc.getMap('config').get('seeded')).toBe(true) // untouched, still true
+    })
+  })
+
+  describe('multi-client seed race (D-04/D-05/D-08/D-09)', () => {
+    /**
+     * D-08/D-09 ESCALATION BOUNDARY -- determination recorded here and in 09-06-SUMMARY.md.
+     *
+     * Empirically reproduced (throwaway probe, run and deleted, mirroring CONTEXT.md's own
+     * feasibility-probe methodology): two independent connect:false connections, both driven to
+     * `synced` BEFORE any relay pump (the true simultaneous window -- neither has observed the
+     * other's `config.seeded` flag), each independently pass the client-side guard and insert
+     * FULL_SCHEMA_HTML. Once pumped, the merged fragment contains the content TWICE (confirmed:
+     * `<heading level="1">Heading 1</heading>` appears 2 times, not 1, after
+     * pumpAtoB()+pumpBtoA()) -- a genuine data-corruption finding, not a test artifact.
+     *
+     * This is NOT a fixable client-side guard bug: Y.XmlFragment structural inserts are
+     * concurrent-append CRDT operations, not last-write-wins like a Y.Map value set. Two clients
+     * that both observe `seeded === false` before either one's write propagates will ALWAYS both
+     * insert, and Yjs will merge (not deduplicate) both insertions -- this holds regardless of
+     * transport topology (peer-relay here, or the real star topology through the server's
+     * `RoomManager`-held canonical Y.Doc), because Yjs updates are commutative/associative by
+     * design. No change contained to the existing client-side effect (EditorPage.tsx:240-254)
+     * closes this window; the only fix that removes the race entirely is SERVER-SIDE seeding
+     * (the server seeds the room's Y.Doc once, before any client ever connects, so no client can
+     * observe `seeded === false`) -- exactly D-09's second branch.
+     *
+     * Per D-09: STOPPED here rather than attempting a fix in this phase. Escalated to
+     * ROADMAP.md as a new phase (10, "Collaborative Seed-Race: Server-Side Seeding") and recorded
+     * in ROADMAP.md's Deviations Register.
+     *
+     * The assertion below is written as the CORRECT expected behavior (exactly once) and is
+     * currently red for the reason documented above -- `it.fails` keeps this a living,
+     * executable reproduction (it will flip to a genuine, visible failure the moment the
+     * underlying race is fixed without this test being updated, which is the point) without
+     * failing the phase's `npm test` gate.
+     */
+    it.fails('asserts seeded content appears exactly once after the simultaneous-window race (currently red -- see comment; escalated per D-08/D-09)', async () => {
+      const connA = makeConnection('race-doc')
+      const connB = makeConnection('race-doc')
+      connectionsToDestroy.push(connA, connB)
+      connQueue.push(connA, connB)
+      registerDoc(makeDocFull({ id: 'race-doc', content_html: FULL_SCHEMA_HTML }))
+
+      const relay = createManualRelay(connA.doc, connB.doc)
+
+      const treeA = renderWithProviders(<EditorPage />, {
+        path: '/documents/:id',
+        initialEntries: ['/documents/race-doc'],
+      })
+      await treeA.findByLabelText('Document title')
+
+      const treeB = renderWithProviders(<EditorPage />, {
+        path: '/documents/:id',
+        initialEntries: ['/documents/race-doc'],
+      })
+      await treeB.findByLabelText('Document title')
+
+      // The simultaneous window: BOTH connections reach `synced` -- and each independently runs
+      // its own seed effect -- BEFORE any pump call exchanges updates. Per D-04/RESEARCH.md's
+      // explicit rejection of an auto-relay: pumping inside the update handler would apply each
+      // side's insert to the other before its own seed effect ever re-checks the flag, closing
+      // this window and passing for the wrong reason.
+      await act(async () => {
+        sync(connA)
+        sync(connB)
+        await Promise.resolve()
+      })
+
+      await act(async () => {
+        relay.pumpAtoB()
+        relay.pumpBtoA()
+        await Promise.resolve()
+      })
+
+      const mergedFragmentString = connA.doc.getXmlFragment('default').toString()
+      // Currently 2, not 1 -- see the escalation comment above.
+      expect(countTag(mergedFragmentString, '<heading level="1">')).toBe(1)
     })
   })
 })
