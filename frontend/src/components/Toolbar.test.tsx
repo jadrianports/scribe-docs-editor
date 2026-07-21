@@ -8,7 +8,8 @@
  * subscription, plus click->command wiring against a stub editor (Task 2 below).
  */
 import { act, render, screen } from '@testing-library/react'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import userEvent from '@testing-library/user-event'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Editor } from '@tiptap/react'
 import StarterKit from '@tiptap/starter-kit'
 import { Toolbar } from './Toolbar'
@@ -56,6 +57,53 @@ function findTextRange(
 
 function midpoint(range: { from: number; to: number }) {
   return Math.floor((range.from + range.to) / 2)
+}
+
+// A self-chaining stub matching every command's `.chain().focus()....run()`
+// shape (Toolbar.tsx:57-85) with a spy per link so click->command wiring can
+// be asserted without a real editor (D-10). `isActive` always returns false
+// -- this describe block is about which commands a click invokes, not about
+// active-mark rendering (already covered above with a real editor).
+function createStubEditor() {
+  const calls = {
+    focus: vi.fn(),
+    toggleBold: vi.fn(),
+    toggleHeading: vi.fn(),
+    toggleBulletList: vi.fn(),
+    run: vi.fn(),
+  }
+
+  const chain = {
+    focus: (...args: unknown[]) => {
+      calls.focus(...args)
+      return chain
+    },
+    toggleBold: (...args: unknown[]) => {
+      calls.toggleBold(...args)
+      return chain
+    },
+    toggleHeading: (...args: unknown[]) => {
+      calls.toggleHeading(...args)
+      return chain
+    },
+    toggleBulletList: (...args: unknown[]) => {
+      calls.toggleBulletList(...args)
+      return chain
+    },
+    run: () => {
+      calls.run()
+      return true
+    },
+  }
+
+  const editor = {
+    isActive: vi.fn(() => false),
+    chain: vi.fn(() => chain),
+    on: vi.fn(),
+    off: vi.fn(),
+  }
+
+  return { editor: editor as unknown as Editor, calls }
 }
 
 describe('Toolbar', () => {
@@ -130,6 +178,52 @@ describe('Toolbar', () => {
       // reflects it -- the second half is what the transaction subscription buys.
       expect(editor.isActive('bold')).toBe(true)
       expect(boldButton).toHaveAttribute('aria-pressed', 'true')
+    })
+  })
+
+  describe('click->command wiring (stub editor, D-10/D-15)', () => {
+    // Subset choice (D-15 discretion): a representative button per distinct
+    // command shape rather than all ten -- a mark toggle with no arguments
+    // (Bold), a heading toggle whose `{ level }` argument must thread through
+    // correctly (Heading 2), and a list toggle with no arguments (Bulleted
+    // list). Italic/Underline/Paragraph/H1/H3/Numbered-list follow the exact
+    // same two shapes already exercised here.
+    it('invokes chain().focus().toggleBold().run() when the Bold button is clicked (mark toggle)', async () => {
+      const { editor, calls } = createStubEditor()
+      const { unmount } = render(<Toolbar editor={editor} />)
+      const user = userEvent.setup()
+
+      await user.click(screen.getByTitle('Bold (Ctrl+B)'))
+
+      expect(calls.focus).toHaveBeenCalledTimes(1)
+      expect(calls.toggleBold).toHaveBeenCalledTimes(1)
+      expect(calls.run).toHaveBeenCalledTimes(1)
+      unmount()
+    })
+
+    it('passes { level: 2 } through to toggleHeading when Heading 2 is clicked (heading-with-level)', async () => {
+      const { editor, calls } = createStubEditor()
+      const { unmount } = render(<Toolbar editor={editor} />)
+      const user = userEvent.setup()
+
+      await user.click(screen.getByTitle('Heading 2'))
+
+      expect(calls.toggleHeading).toHaveBeenCalledWith({ level: 2 })
+      expect(calls.run).toHaveBeenCalledTimes(1)
+      unmount()
+    })
+
+    it('invokes chain().focus().toggleBulletList().run() when the Bulleted list button is clicked (list toggle)', async () => {
+      const { editor, calls } = createStubEditor()
+      const { unmount } = render(<Toolbar editor={editor} />)
+      const user = userEvent.setup()
+
+      await user.click(screen.getByTitle('Bulleted list'))
+
+      expect(calls.focus).toHaveBeenCalledTimes(1)
+      expect(calls.toggleBulletList).toHaveBeenCalledTimes(1)
+      expect(calls.run).toHaveBeenCalledTimes(1)
+      unmount()
     })
   })
 })
