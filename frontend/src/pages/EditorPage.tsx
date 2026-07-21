@@ -198,6 +198,11 @@ function CollaborativeEditor({
 
   const editor = useEditor({
     editable,
+    // Explicit rather than relying on TipTap v3's client default (which is
+    // already `true` here — this is not a behaviour change). Stated so the
+    // synchronous-view contract useCollab.ts:105-115's queueMicrotask
+    // workaround depends on is a visible fact, not an invisible default.
+    immediatelyRender: true,
     extensions: [
       StarterKit.configure({
         heading: { levels: [1, 2, 3] },
