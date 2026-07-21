@@ -155,7 +155,6 @@ function EditorInner({ doc }: { doc: DocFull }) {
         <CollaborativeEditor
           key={conn.doc.guid}
           conn={conn}
-          contentHtml={doc.content_html}
           editable={editable}
           title={title}
           user={user}
@@ -183,13 +182,11 @@ function EditorInner({ doc }: { doc: DocFull }) {
  */
 function CollaborativeEditor({
   conn,
-  contentHtml,
   editable,
   title,
   user,
 }: {
   conn: CollabConnection
-  contentHtml: string
   editable: boolean
   title: string
   user: User | null
@@ -219,44 +216,9 @@ function CollaborativeEditor({
         user: { name: user?.name ?? 'Anonymous', color: caretColor(user?.id ?? 0) },
       }),
     ],
-    // No `content:` -- the document body comes from the shared Y.Doc, not
-    // from `content_html` directly (that's only used once, below, to seed a
-    // document that has never been opened for collaboration before).
+    // No `content:` -- the document body comes from the shared Y.Doc, which
+    // the server seeds before any client connects (Phase 10).
   })
-
-  // Seed the shared doc once from the document's last-saved HTML. Guarded so
-  // that N clients opening the same never-collaborated-on document don't
-  // each insert their own copy: `doc.getMap('config')` is itself part of the
-  // synced CRDT state, so once the first client to observe "synced but not
-  // yet seeded" flips the flag, that update propagates to every other
-  // client and none of them re-run `setContent`.
-  //
-  // Listens for the (correctly-typed) 'sync' event -- the runtime also
-  // emits an identically-timed 'synced' event, but the installed type
-  // definitions only declare 'sync', so 'synced' fails `tsc --noEmit`.
-  // Also checks `provider.synced` directly, both immediately after
-  // subscribing (the event is edge-triggered -- only fires on a state
-  // *transition* -- so a listener that subscribes after the handshake
-  // already completed would otherwise miss it forever) and inside the
-  // handler itself (the same event also fires on false->true *and*
-  // true->false, e.g. a disconnect; re-checking the live getter rather than
-  // trusting "the event fired" keeps a disconnect from being treated as a
-  // sync).
-  useEffect(() => {
-    const trySeed = () => {
-      if (!provider.synced) return
-      const config = ydoc.getMap('config')
-      if (!config.get('seeded') && editor && contentHtml) {
-        config.set('seeded', true)
-        editor.commands.setContent(contentHtml)
-      }
-    }
-    provider.on('sync', trySeed)
-    trySeed()
-    return () => {
-      provider.off('sync', trySeed)
-    }
-  }, [provider, ydoc, editor, contentHtml])
 
   return (
     <>
