@@ -10,7 +10,7 @@ from pycrdt import Doc
 from pycrdt.store import YDocNotFound
 from pycrdt.websocket import YRoom
 
-from . import snapshot
+from . import seeding, snapshot
 from .ystore import ScribeYStore
 
 log = logging.getLogger(__name__)
@@ -326,6 +326,21 @@ class RoomManager:
                 # reading `pycrdt/websocket/yroom.py` after this race
                 # reproduced deterministically (empty YStore after an insert).
                 await room.ydoc_observed.wait()
+
+                # Seed exactly once, here -- after ydoc_observed (so the seed
+                # is never lost the way an earlier mutation would be, see
+                # above) and before the dirty-subscription registration just
+                # below (so the seed itself never marks a freshly-seeded room
+                # dirty -- D-11, seed-then-observe). Runs inside the same
+                # fail_after(self._startup_timeout) critical section as the
+                # rest of _create_room -- no new timeout (D-14) -- and under
+                # this doc_id's own per-doc lock, which is what makes this
+                # exactly-once under concurrent get() calls (D-08).
+                # seed_room already swallows its own exceptions (D-12), so it
+                # is deliberately not wrapped in an additional try/except
+                # here -- the except BaseException below is for genuinely
+                # fatal startup failures, not seed failures.
+                seeding.seed_room(doc_id, room.ydoc)
 
                 record = RoomRecord(doc_id=doc_id, room=room, start_task=task)
                 # The ticker's own dirty-flag subscription is registered only

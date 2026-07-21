@@ -106,11 +106,18 @@ def test_release_does_not_overwrite_content_when_room_never_seeded(
 
 
 def test_release_writes_snapshot_when_room_was_seeded(tmp_path, monkeypatch, db_session, seed_users):
-    """The seeded counterpart to the test above: once a client has actually
-    seeded the room (flips the same `config`/`seeded` flag EditorPage.tsx's
-    seed effect sets), release() DOES derive and persist the live HTML --
-    proving the guard only skips the specific "never seeded" case, not
-    every snapshot write.
+    """The seeded counterpart to the test above: once a room is seeded (now
+    done server-side by `_create_room` itself -- plan 10-05, D-08 -- rather
+    than by a client's seed effect), release() DOES derive and persist the
+    live HTML, proving the guard only skips the specific "never seeded" case,
+    not every snapshot write.
+
+    Since `mgr.get("seeded-1")` now seeds the room from `content_html`
+    ("<p>stale</p>") before this scenario's own code ever runs, the manual
+    `config["seeded"] = True` line below is a no-op (already true) rather
+    than the thing that flips seeded-ness -- and the live-edit paragraph is
+    appended AFTER the already-seeded stale content, not in isolation, so the
+    persisted snapshot reflects both.
     """
     monkeypatch.chdir(tmp_path)
     doc = Document(
@@ -121,8 +128,8 @@ def test_release_writes_snapshot_when_room_was_seeded(tmp_path, monkeypatch, db_
 
     async def scenario():
         mgr = RoomManager()
-        room = await mgr.get("seeded-1")
-        room.ydoc.get("config", type=Map)["seeded"] = True  # mirror EditorPage.tsx's seed effect
+        room = await mgr.get("seeded-1")  # already seeded with "<p>stale</p>" by _create_room
+        room.ydoc.get("config", type=Map)["seeded"] = True  # already True -- no-op
         frag = room.ydoc.get("default", type=XmlFragment)
         para = XmlElement("paragraph")
         frag.children.append(para)
@@ -133,7 +140,7 @@ def test_release_writes_snapshot_when_room_was_seeded(tmp_path, monkeypatch, db_
 
     db_session.expire_all()
     saved = db_session.get(Document, "seeded-1")
-    assert saved.content_html == "<p>live edit</p>"
+    assert saved.content_html == "<p>stale</p><p>live edit</p>"
 
 
 def test_write_snapshot_sanitizes_before_storing(tmp_path, monkeypatch, db_session, seed_users):

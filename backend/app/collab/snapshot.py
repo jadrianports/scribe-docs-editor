@@ -24,6 +24,7 @@ from ..content import sanitize_html
 from ..db import SessionLocal
 from ..models import Document
 from .html import ydoc_to_html
+from .seeding import CONFIG_MAP_NAME, SEEDED_KEY
 
 
 def derive_snapshot_html(ydoc: Doc) -> str | None:
@@ -62,7 +63,7 @@ def derive_snapshot_html(ydoc: Doc) -> str | None:
     sync with whatever "seeded" means client-side by construction, not by
     separately guessing/reimplementing that contract server-side.
     """
-    if not ydoc.get("config", type=Map).get("seeded"):
+    if not ydoc.get(CONFIG_MAP_NAME, type=Map).get(SEEDED_KEY):
         return None
     return sanitize_html(ydoc_to_html(ydoc))  # the sanitization invariant holds here
 
