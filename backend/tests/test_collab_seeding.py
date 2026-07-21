@@ -1,18 +1,21 @@
 """Tests for the server-side HTML -> Y.Doc seed converter and `seed_room`
 orchestrator (D-06).
 
-Unit-level only for this plan (10-04): the converter round-trip in
-isolation, `seed_room`'s idempotence (D-18b), and its failure invariant
-(D-20). The live-room concurrency proof (D-18a) and the full-schema
-round-trip through a real room (D-19) land in plan 10-05, once
-`rooms.py`'s `_create_room` actually calls `seed_room`.
+Unit-level for plan 10-04: the converter round-trip in isolation,
+`seed_room`'s idempotence (D-18b), and its failure invariant (D-20).
+Live-room for plan 10-05, now that `rooms.py`'s `_create_room` actually
+calls `seed_room` (D-08): the true-concurrency exactly-once proof (D-18a,
+Criterion 1) and the full-schema round trip through a real room (D-19).
 """
 
 import gc
 
+import anyio
 from pycrdt import Doc, XmlFragment
 from app.collab import seeding as collab_seeding
+from app.collab import snapshot as collab_snapshot
 from app.collab.html import ydoc_to_html
+from app.collab.rooms import RoomManager
 from app.collab.seeding import _already_seeded, _html_to_prelim_tree, _materialize, seed_room
 from app.content import sanitize_html
 from app.models import Document
@@ -125,4 +128,95 @@ def test_failure_seed_room_leaves_fragment_exactly_empty_and_seeded_false(
     db_session.expire_all()  # seed_room reads via its own SessionLocal
     saved = db_session.get(Document, "seed-fail-1")
     assert saved.content_html == "<p>real content</p>"
+    gc.collect()
+
+
+def test_exactly_once_seed_under_true_concurrency(tmp_path, monkeypatch, db_session, seed_users):
+    """D-18a / Criterion 1: the true-concurrency test that would have caught
+    the original multi-client seed race. A Document row exists with
+    non-empty `content_html` and has never been collaboratively seeded. Two
+    simultaneous `mgr.get(doc_id)` calls for that SAME never-seeded doc_id
+    (started concurrently via `anyio.create_task_group` + two
+    `tg.start_soon(...)`, not one awaited after the other) must result in
+    the canonical room ydoc containing the seed content EXACTLY once, with
+    `config.seeded` true -- proving Criterion 2 ("server-side by
+    construction") holds under real concurrency, not just sequentially.
+
+    This falls out of `_create_room` running the whole rehydrate-seed-
+    subscribe sequence under `doc_id`'s own per-doc lock (D-08): whichever
+    `get()` call wins the lock race builds (and seeds) the one room; the
+    other blocks on the SAME lock and, once unblocked, finds the room
+    already cached rather than building (and seeding) a second one -- which
+    is also why both calls share one cached `RoomRecord` (`rec.count == 2`)
+    instead of two independent rooms.
+    """
+    monkeypatch.chdir(tmp_path)
+    doc_row = Document(
+        id="race-1",
+        title="T",
+        content_html="<p>hello world</p>",
+        owner_id=seed_users["alice"].id,
+    )
+    db_session.add(doc_row)
+    db_session.commit()
+
+    async def scenario():
+        mgr = RoomManager()
+
+        async def get_it():
+            await mgr.get("race-1")
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(get_it)
+            tg.start_soon(get_it)
+
+        rec = mgr._rooms_by_id["race-1"]
+        assert rec.count == 2  # both gets shared one cached room, not two
+
+        assert _already_seeded(rec.room.ydoc) is True
+        html = ydoc_to_html(rec.room.ydoc)
+        assert html.count("hello world") == 1  # seed content landed exactly once
+
+        await mgr.release("race-1")
+        await mgr.release("race-1")
+
+    anyio.run(scenario)
+    gc.collect()
+
+
+def test_live_room_full_schema_round_trip_is_idempotent_on_second_pass(
+    tmp_path, monkeypatch, db_session, seed_users
+):
+    """D-19/D-04: opening a never-seeded document's room via
+    `room_manager.get(doc_id)` seeds it server-side (D-08); deriving HTML
+    back from the LIVE room's ydoc equals `sanitize_html(FULL_SCHEMA_HTML)`
+    -- the same idempotent-on-second-pass invariant as
+    `test_convert_smoke_full_schema_round_trip_is_idempotent_on_second_pass`
+    above, now proven through a real room (real rehydrate/seed/observe
+    sequence) rather than a bare `Doc()` + direct `_materialize` call. This
+    is NOT a byte-exact-ingest assertion -- a future reader must not
+    "fix" this into a stronger byte-equality check (see that test's own
+    docstring for why).
+    """
+    monkeypatch.chdir(tmp_path)
+    doc_row = Document(
+        id="roundtrip-1",
+        title="T",
+        content_html=FULL_SCHEMA_HTML,
+        owner_id=seed_users["alice"].id,
+    )
+    db_session.add(doc_row)
+    db_session.commit()
+
+    async def scenario():
+        mgr = RoomManager()
+        room = await mgr.get("roundtrip-1")  # seeds server-side on creation (D-08)
+
+        assert _already_seeded(room.ydoc) is True
+        html = collab_snapshot.derive_snapshot_html(room.ydoc)
+        assert html == sanitize_html(FULL_SCHEMA_HTML)
+
+        await mgr.release("roundtrip-1")
+
+    anyio.run(scenario)
     gc.collect()
