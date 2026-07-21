@@ -288,6 +288,23 @@ def seed_room(doc_id: str, ydoc: Doc) -> None:
     fragment stays exactly empty and `config.seeded` stays false (D-20).
     On success, `config.seeded` flips true even for an empty `content_html`
     (D-10) -- every room that serves a client has been seeded.
+
+    WR-01: `Transaction.__exit__` commits unconditionally even when an
+    exception is raised inside the `with` block (module docstring), so an
+    exception from `_materialize` mid-tree is not rolled back -- whatever
+    was already appended before the raise stays committed (and, since this
+    runs after `ydoc_observed`, gets persisted) while `config.seeded` never
+    gets set (the raise happens before that line). Without the `len(...) ==
+    0` guard below, the *next* `seed_room` call for this doc_id would see
+    "not yet seeded," rehydrate that partial leftover, and materialize the
+    *full* tree again on top of it -- duplicated content. Guarding on the
+    fragment already being non-empty makes a retry a safe no-op-on-content
+    (still flips `config.seeded` true, so the room isn't stuck retrying
+    forever) instead of a duplicating one. This does not change the
+    exception itself propagating out of `seed_room` on the failing call
+    (still uncaught here by design, per this function's own materialize
+    section never being wrapped in try/except) -- it only makes the
+    following retry's behavior safe.
     """
     if _already_seeded(ydoc):
         return
@@ -301,6 +318,7 @@ def seed_room(doc_id: str, ydoc: Doc) -> None:
         return
     with ydoc.transaction():
         frag = ydoc.get("default", type=XmlFragment)
-        for child in built_children:
-            _materialize(frag, child)
+        if len(frag.children) == 0:  # WR-01: skip re-materializing a partial leftover on retry
+            for child in built_children:
+                _materialize(frag, child)
         ydoc.get(CONFIG_MAP_NAME, type=Map)[SEEDED_KEY] = True  # D-10: flip only after a clean build

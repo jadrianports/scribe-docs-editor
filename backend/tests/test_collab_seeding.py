@@ -11,6 +11,7 @@ Criterion 1) and the full-schema round trip through a real room (D-19).
 import gc
 
 import anyio
+import pytest
 from pycrdt import Doc, XmlFragment
 from app.collab import seeding as collab_seeding
 from app.collab import snapshot as collab_snapshot
@@ -119,6 +120,56 @@ def test_seed_room_wraps_leading_bare_text_instead_of_failing_permanently(
 
     assert _already_seeded(ydoc) is True
     assert ydoc_to_html(ydoc) == "<p>hello </p><p>world</p>"
+    gc.collect()
+
+
+def test_seed_room_retry_after_materialize_failure_does_not_duplicate_content(
+    tmp_path, monkeypatch, db_session, seed_users
+):
+    """WR-01 regression: `Transaction.__exit__` commits unconditionally even
+    when an exception is raised inside the `with` block, so a `_materialize`
+    exception partway through a multi-child tree still commits whatever was
+    already appended before the raise, while `config.seeded` never gets set
+    (the raise happens before that line). Pins the fixed retry behavior: the
+    next `seed_room` call for the same doc_id must recognize the fragment is
+    already non-empty, skip re-materializing on top of it (which would
+    duplicate content), and still flip `config.seeded` true so the room
+    isn't stuck retrying forever.
+    """
+    monkeypatch.chdir(tmp_path)
+    doc_row = Document(
+        id="seed-retry-1",
+        title="T",
+        content_html="<p>one</p><p>two</p><p>three</p>",
+        owner_id=seed_users["alice"].id,
+    )
+    db_session.add(doc_row)
+    db_session.commit()
+
+    ydoc = Doc()
+    real_materialize = collab_seeding._materialize
+    call_count = {"n": 0}
+
+    def _flaky_materialize(container, node):
+        call_count["n"] += 1
+        if call_count["n"] == 2:  # let the first top-level child land, then raise
+            raise RuntimeError("boom mid-materialize")
+        real_materialize(container, node)
+
+    monkeypatch.setattr(collab_seeding, "_materialize", _flaky_materialize)
+
+    with pytest.raises(RuntimeError):
+        seed_room("seed-retry-1", ydoc)
+
+    frag = ydoc.get("default", type=XmlFragment)
+    assert _already_seeded(ydoc) is False
+    assert len(frag.children) == 1  # exactly the one child that landed before the raise
+
+    monkeypatch.setattr(collab_seeding, "_materialize", real_materialize)
+    seed_room("seed-retry-1", ydoc)  # retry -- must not duplicate the partial leftover
+
+    assert _already_seeded(ydoc) is True
+    assert len(frag.children) == 1  # unchanged: retry skipped re-materializing
     gc.collect()
 
 
