@@ -115,4 +115,62 @@ describe('useCollab', () => {
     // again. This test's discriminating power is proven, not assumed.
     unmount()
   })
+
+  it('seeds peers as an empty array on mount, before any awareness change arrives', () => {
+    // Pins the synchronous onAwarenessChange() call made right after
+    // provider.awareness.on('change', ...) in useCollab.ts -- distinct from the
+    // change-driven updates covered below. This is an isolated hook test with no editor
+    // mounted (no CollaborationCaret writing a local user field), so the seed has nothing
+    // to report yet -- but it must produce a real, settled [] from that call, not leave
+    // peers stale/undefined pending a first 'change' event that may never come.
+    const { result, unmount } = renderHook(() => useCollab('doc-1'))
+    expect(result.current.peers).toEqual([])
+    unmount()
+  })
+
+  it('a joining peer appears after the microtask flush', async () => {
+    const { result, unmount } = renderHook(() => useCollab('doc-1'))
+    const provider = result.current.conn!.provider
+
+    await act(async () => {
+      provider.awareness.setLocalState({ user: { name: 'Bob', color: '#fff' } })
+      // queueMicrotask (useCollab.ts) isn't faked by Vitest's timer mock by default -- a
+      // bare await is the correct and only flush needed (RESEARCH.md Pattern 4), and
+      // wrapping the mutation + flush together in act() keeps the deferred setPeers call
+      // inside an act() scope (RESEARCH.md Pattern 5).
+      await Promise.resolve()
+    })
+
+    expect(result.current.peers).toEqual([
+      { clientId: provider.doc.clientID, name: 'Bob', color: '#fff', self: true },
+    ])
+
+    unmount()
+  })
+
+  it('a cursor-only awareness change keeps peers referentially stable', async () => {
+    const { result, unmount } = renderHook(() => useCollab('doc-1'))
+    const provider = result.current.conn!.provider
+
+    await act(async () => {
+      provider.awareness.setLocalState({ user: { name: 'Bob', color: '#fff' } })
+      await Promise.resolve()
+    })
+    const peersAfterJoin = result.current.peers
+
+    await act(async () => {
+      // Same name/color -- only a peer-identity-irrelevant field changes.
+      provider.awareness.setLocalState({
+        user: { name: 'Bob', color: '#fff' },
+        cursor: { pos: 4 },
+      })
+      await Promise.resolve()
+    })
+
+    // samePeers' referential-stability bailout (useCollab.ts): an identical derived peer
+    // list means setPeers returns the SAME array reference, not a new one.
+    expect(result.current.peers).toBe(peersAfterJoin)
+
+    unmount()
+  })
 })
