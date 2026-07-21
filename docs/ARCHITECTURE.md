@@ -98,8 +98,12 @@ it's re-rendered from the live Y.Doc (`ydoc_to_html`) and pushed back through th
 *same* `sanitize_html` allow-list every other write path already uses (decision 1's
 invariant holds here too — not a second, divergent sanitizer) when a document's last
 editor disconnects and its room empties. A document that's never been opened for
-collaboration is seeded into its Y.Doc from that same `content_html` the first time
-anyone opens it, guarded so simultaneous first-openers don't each insert their own copy.
+collaboration is seeded into its Y.Doc from that same `content_html` — but that seed
+happens **server-side**: `RoomManager._create_room` converts the stored HTML into the
+room's Y.Doc and flips its `seeded` flag once, under that document's own per-doc lock,
+before any client connection is accepted. The client has no seeding logic of its own at
+all — it only ever reads the already-seeded shared doc — so the seed genuinely happens
+exactly once, by construction, not by a client-side guard racing another client's guard.
 
 Access control rides along unchanged: the WebSocket authenticates off the same session
 cookie and authorizes through the same `effective_role` used everywhere else (decision
@@ -125,13 +129,15 @@ to deploy" story (above) true for this feature too.
   an exact/continuous guarantee. A hard kill (SIGKILL, no chance to run the
   shutdown flush) still costs at most one tick interval, never the whole
   session.
-- **A low-probability seed race.** Two clients opening a document that has never been
-  collaboratively edited before, at the exact same instant, could both observe
-  "not yet seeded" and each insert the saved content before either one's seeded flag
-  propagates — a duplicate-content race with vanishingly small odds in practice (it
-  needs two people to open the same brand-new-to-collaboration document within the
-  same network round-trip) and no corruption risk (Yjs still merges both inserts
-  deterministically), just a cosmetic doubled paragraph.
+- **The multi-client seed race is closed by construction, not mitigated.** An earlier
+  version of this design seeded a never-collaborated-on document from the client, the
+  first time any editor opened it — which meant two clients opening the same
+  brand-new-to-collaboration document at the exact same instant could both observe
+  "not yet seeded" and each insert the saved content, since Yjs merges concurrent
+  structural inserts rather than deduplicating them. Seeding moved server-side (into
+  `RoomManager._create_room`, under the per-doc lock, before any client connects) so
+  there is exactly one seed writer and it always runs before the first client is
+  served — there is no window left in which two openers can race each other.
 - **Single instance only.** Rooms live in one process's memory; nothing fans updates
   out across instances. Fine for the single-service deploy this project ships
   (decision 4 already keeps everything to one process), but it's the one piece of this
