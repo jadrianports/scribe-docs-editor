@@ -128,12 +128,19 @@ def _parse_fragment(raw_html: str):
     `content_html` has un-self-closed void tags (`<br>`) and multiple
     top-level sibling elements, both of which violate the well-formed-XML
     requirements that submodule enforces.
-    `no_leading_text=True` raises on genuine top-level leading text --
-    `content_html` (bleach-sanitized, always block-wrapped) should never
-    start with bare text, so that shape is a parse failure worth surfacing
-    (caught by `seed_room`'s try/except) rather than silently swallowing.
+    Leading text is allowed, not rejected (CR-01): `sanitize_html` (bleach)
+    strips disallowed tags but never *adds* a block wrapper around bare
+    text, so `content_html` written through the app's own
+    `PATCH /documents/{doc_id}` endpoint can legitimately start with bare,
+    non-block-wrapped text -- rejecting that shape (the old
+    `no_leading_text=True`) turned a normal write into a permanent, silent
+    seed failure. Without that flag, `fragments_fromstring` hands leading/
+    orphan text back as a plain `str` in the returned list;
+    `_convert_block_siblings` wraps it in its own paragraph, the same
+    treatment already given to orphaned *tail* text between siblings
+    (D-03).
     """
-    return lxml_html.fragments_fromstring(raw_html, no_leading_text=True)
+    return lxml_html.fragments_fromstring(raw_html)
 
 
 def _is_block_tag(tag: str) -> bool:
@@ -219,9 +226,21 @@ def _convert_block_siblings(elements) -> list[_PrelimElement]:
     returns into prelim block nodes, applying D-05's whitespace-only-tail
     drop between top-level siblings; genuine (non-whitespace) orphaned text
     falls back to its own paragraph (D-03), never raising.
+
+    `elements` may itself start with a plain `str` (CR-01): without
+    `no_leading_text=True`, genuine top-level leading text -- the shape
+    `content_html` written via `PATCH /documents/{doc_id}` can legitimately
+    have, since `sanitize_html` never adds a block wrapper -- comes back
+    from lxml as a bare string rather than raising. It gets the exact same
+    treatment as orphaned tail text below: wrapped in its own paragraph if
+    non-whitespace, dropped if whitespace-only.
     """
     blocks: list[_PrelimElement] = []
     for el in elements:
+        if isinstance(el, str):
+            if el.strip():
+                blocks.append(_PrelimElement("paragraph", {}, [_PrelimText([(el, {})])]))
+            continue
         blocks.append(_convert_block_element(el))
         tail = el.tail
         if tail and tail.strip():

@@ -92,6 +92,36 @@ def test_idempotent_seed_room_second_call_is_a_noop(tmp_path, monkeypatch, db_se
     gc.collect()
 
 
+def test_seed_room_wraps_leading_bare_text_instead_of_failing_permanently(
+    tmp_path, monkeypatch, db_session, seed_users
+):
+    """CR-01 regression: `content_html` starting with bare, non-block-wrapped
+    text is reachable through the app's own `PATCH /documents/{doc_id}`
+    endpoint -- `sanitize_html` strips disallowed tags but never adds a
+    block wrapper around bare text. Before this fix, `_parse_fragment`'s
+    `no_leading_text=True` turned this shape into a permanent, silent seed
+    failure (`config.seeded` could never become true for that document).
+    The leading text must instead be wrapped in its own paragraph, the same
+    treatment already given to orphaned tail text (D-03).
+    """
+    monkeypatch.chdir(tmp_path)
+    doc_row = Document(
+        id="seed-bare-1",
+        title="T",
+        content_html="hello <p>world</p>",
+        owner_id=seed_users["alice"].id,
+    )
+    db_session.add(doc_row)
+    db_session.commit()
+
+    ydoc = Doc()
+    seed_room("seed-bare-1", ydoc)
+
+    assert _already_seeded(ydoc) is True
+    assert ydoc_to_html(ydoc) == "<p>hello </p><p>world</p>"
+    gc.collect()
+
+
 def test_failure_seed_room_leaves_fragment_exactly_empty_and_seeded_false(
     tmp_path, monkeypatch, db_session, seed_users
 ):
