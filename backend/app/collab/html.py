@@ -84,6 +84,15 @@ import html as html_lib
 
 from pycrdt import Doc, XmlElement, XmlFragment, XmlText
 
+# Shared surface (backend/app/collab/seeding.py imports and inverts the five
+# tables below -- D-07): renaming, removing, or changing the shape of any
+# table in this block without updating seeding.py's reverse maps
+# (_TAG_TO_BLOCK, _LEVEL_TO_HEADING) silently breaks the server-side seed
+# path. They stay defined here, at module level, under these exact names --
+# D-07 forbids moving them out of html.py; seeding.py does a plain
+# cross-module import, not a re-export. This is a documentation-contract
+# only: nothing below this comment changes ydoc_to_html's behavior.
+
 # ProseMirror heading level -> HTML tag. Only 1-3 are in the editor schema
 # (frontend caps `StarterKit.configure({ heading: { levels: [1, 2, 3] } })`)
 # and content.ALLOWED_TAGS only allows h1-h3; an out-of-range OR non-numeric
