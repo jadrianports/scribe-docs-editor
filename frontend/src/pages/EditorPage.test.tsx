@@ -1,7 +1,11 @@
 /**
- * Single owner for every EditorPage collaboration/seed-path test (D-15): brand-new-doc seeding,
- * reopened-doc idempotency, the multi-client seed race, the mutation-validated criterion-1 React
- * key, the `immediatelyRender: true` synchronous-view contract (D-13), and flush-on-unmount.
+ * Single owner for every EditorPage collaboration test: the multi-client seed race (Phase 10
+ * inverted this to model server-side seeding per D-15/D-17), the mutation-validated criterion-1
+ * React key, the `immediatelyRender: true` synchronous-view contract (D-13), and
+ * flush-on-unmount. The two client-side seed-effect tests that used to live here ('seeds a
+ * brand-new document exactly once', 'does not double-insert when reopening an already-seeded
+ * document') were removed in Phase 10 -- their subject, EditorPage's client seed effect, no
+ * longer exists once the client became purely subtractive (D-15).
  *
  * EditorPage calls `useCollab(doc.id)` internally -- it does not accept a `conn` prop -- so the
  * only way to compose against `collabHarness.ts`'s `connect:false` `makeConnection()` (as Task 1's
@@ -54,7 +58,6 @@ import StarterKit from '@tiptap/starter-kit'
 import Collaboration from '@tiptap/extension-collaboration'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
-import * as Y from 'yjs'
 import { renderWithProviders, screen } from '../test/renderWithProviders'
 import { makeConnection, sync } from '../test/collabHarness'
 import type { TestCollabConnection } from '../test/collabHarness'
@@ -133,16 +136,18 @@ afterEach(() => {
 
 // --- Fragment-shape helpers (D-05/D-12: assert on ydoc.getXmlFragment(...), never getHTML()) ---
 
+/** Counts (non-overlapping) occurrences of a literal open-tag substring in a fragment string. */
+function countTag(fragmentString: string, tagOpen: string): number {
+  return fragmentString.split(tagOpen).length - 1
+}
+
 /**
- * Builds a Y.Doc + real editor completely independent of any test connection, seeds it once from
- * FULL_SCHEMA_HTML, and returns its fragment's string form -- the canonical "exactly one clean
- * seed" shape every seed test compares against. Using a live reference (not a hand-copied
- * constant) means this stays correct if fullSchemaFixture.ts's content ever changes, and it is
- * the strongest single assertion available: any duplication, omission or reordering in the
- * system-under-test's fragment changes this string.
+ * Writes `html` directly into `doc`'s shared fragment via a real, disposable Editor+Collaboration
+ * instance bound to `doc` -- i.e. from OUTSIDE any mounted EditorPage tree, simulating another
+ * peer (or, for FULL_SCHEMA_HTML, the server) writing into the shared CRDT. The reference editor
+ * is destroyed immediately after so it doesn't linger as a second view over `doc`.
  */
-function buildSingleSeedFragmentString(): string {
-  const referenceDoc = new Y.Doc()
+function writeContent(doc: TestCollabConnection['doc'], html: string): void {
   const referenceEditor = new Editor({
     extensions: [
       StarterKit.configure({
@@ -153,144 +158,50 @@ function buildSingleSeedFragmentString(): string {
         horizontalRule: false,
         undoRedo: false,
       }),
-      Collaboration.configure({ document: referenceDoc }),
+      Collaboration.configure({ document: doc }),
     ],
   })
-  referenceEditor.commands.setContent(FULL_SCHEMA_HTML)
-  const fragmentString = referenceDoc.getXmlFragment('default').toString()
+  referenceEditor.commands.setContent(html)
   referenceEditor.destroy()
-  referenceDoc.destroy()
-  return fragmentString
 }
 
-/** Counts (non-overlapping) occurrences of a literal open-tag substring in a fragment string. */
-function countTag(fragmentString: string, tagOpen: string): number {
-  return fragmentString.split(tagOpen).length - 1
+/**
+ * Seeds a real, connection-backed doc the way the server now does (D-08's seed-before-serve
+ * contract, backend/app/collab/seeding.py): `writeContent(doc, FULL_SCHEMA_HTML)` then flips
+ * `config.seeded`.
+ */
+function seedDocServerStyle(doc: TestCollabConnection['doc']): void {
+  writeContent(doc, FULL_SCHEMA_HTML)
+  doc.getMap('config').set('seeded', true)
 }
 
 describe('EditorPage', () => {
-  describe('seed-on-mount (D-03/D-05/D-12)', () => {
-    it('seeds a brand-new document exactly once', async () => {
-      const conn = makeConnection('doc-brand-new')
-      connectionsToDestroy.push(conn)
-      connQueue.push(conn)
-      registerDoc(makeDocFull({ id: 'doc-brand-new', content_html: FULL_SCHEMA_HTML }))
-
-      renderWithProviders(<EditorPage />, {
-        path: '/documents/:id',
-        initialEntries: ['/documents/doc-brand-new'],
-      })
-      await screen.findByLabelText('Document title')
-
-      // Not synced yet -- trySeed's `if (!provider.synced) return` guard means the fragment is
-      // still untouched at this point, confirming the assertions below are about the seed EFFECT
-      // running, not some pre-existing content.
-      expect(conn.doc.getXmlFragment('default').toString()).toBe('')
-
-      await act(async () => {
-        sync(conn) // provider.synced = true -- drives EditorPage.tsx:254's trySeed via 'sync'
-        await Promise.resolve()
-      })
-
-      const seededFragmentString = conn.doc.getXmlFragment('default').toString()
-      const referenceFragmentString = buildSingleSeedFragmentString()
-
-      // Strongest evidence: the WHOLE seeded structure matches a known-clean single seed exactly
-      // -- any double-insert, drop, or reorder changes this string.
-      expect(seededFragmentString).toBe(referenceFragmentString)
-
-      // Itemized per-node-name coverage (D-12's letter), each count taken from the SAME reference
-      // string above rather than a hand-guessed literal, so these can't silently drift out of
-      // sync with fullSchemaFixture.ts. Tags are matched as OPEN tags (`<name` or `<name attr=`)
-      // -- a bare substring like "bold" also matches the closing `</bold>` tag AND the literal
-      // word "bold" in the run's own text content, which is not what "appears once" means here
-      // (probe-verified: bare "bulletlist" counted 2 for one legitimate element, one open + one
-      // close). Structural node names that are genuinely unique in the fixture assert 1;
-      // bold/italic/underline/strike assert 2 -- not 1 -- because fullSchemaFixture.ts's
-      // FULL_SCHEMA_HTML deliberately includes one standalone run of each mark PLUS a combined
-      // "combo" run wrapping all four together (09-02-SUMMARY.md's own deviation note), and
-      // Y.XmlText's toString() renders each mark as a real nested tag, not a single merged one --
-      // so a correct single seed legitimately produces two `<bold>` open-tag substrings, not one.
-      // Asserting a literal "1" here would either fail on correct code or require weakening the
-      // shared fixture this plan doesn't own; see 09-06-SUMMARY.md.
-      for (const tag of ['<heading level="1">', '<heading level="2">', '<heading level="3">', '<bulletlist>', '<orderedlist', '<blockquote>']) {
-        expect(countTag(seededFragmentString, tag)).toBe(countTag(referenceFragmentString, tag))
-        expect(countTag(seededFragmentString, tag)).toBe(1)
-      }
-      for (const mark of ['<bold>', '<italic>', '<underline>', '<strike>']) {
-        expect(countTag(seededFragmentString, mark)).toBe(countTag(referenceFragmentString, mark))
-        expect(countTag(seededFragmentString, mark)).toBe(2)
-      }
-
-      // D-03: pin the exact literals the cross-language contract depends on. The counterpart is
-      // backend/app/collab/snapshot.py's derive_snapshot_html, which reads
-      // `ydoc.get("config", type=Map).get("seeded")` -- same map name "config", same key
-      // "seeded" -- already pinned from the Python side in
-      // backend/tests/test_collab_persistence.py. Changing either side's literal breaks this pin.
-      expect(conn.doc.getMap('config').get('seeded')).toBe(true)
-    })
-
-    it('does not double-insert when reopening an already-seeded document', async () => {
-      const conn = makeConnection('doc-reopened')
-      connectionsToDestroy.push(conn)
-      // Simulates reopening a document that was already collaboratively seeded in a prior
-      // session -- pre-set the flag BEFORE mount, mirroring what a real second-open would see.
-      conn.doc.getMap('config').set('seeded', true)
-      connQueue.push(conn)
-      registerDoc(makeDocFull({ id: 'doc-reopened', content_html: FULL_SCHEMA_HTML }))
-
-      renderWithProviders(<EditorPage />, {
-        path: '/documents/:id',
-        initialEntries: ['/documents/doc-reopened'],
-      })
-      await screen.findByLabelText('Document title')
-
-      await act(async () => {
-        sync(conn)
-        await Promise.resolve()
-      })
-
-      // The seed effect's `!config.get('seeded')` guard must no-op: the fragment stays exactly as
-      // empty as it started, never gaining a copy of FULL_SCHEMA_HTML.
-      expect(conn.doc.getXmlFragment('default').toString()).toBe('')
-      expect(conn.doc.getMap('config').get('seeded')).toBe(true) // untouched, still true
-    })
-  })
-
-  describe('multi-client seed race (D-04/D-05/D-08/D-09)', () => {
+  describe('multi-client seed race -- closed server-side (D-04/D-08/D-09/D-15/D-17)', () => {
     /**
-     * D-08/D-09 ESCALATION BOUNDARY -- determination recorded here and in 09-06-SUMMARY.md.
+     * PHASE 10 CLOSURE -- this test used to be a documented-red `it.fails(...)` reproduction of a
+     * genuine multi-client seed race (see 09-06-SUMMARY.md and this phase's 10-CONTEXT.md for the
+     * full history: two independent connect:false connections, both driven to `synced` in the true
+     * simultaneous window before any relay pump, would each independently pass the client-side
+     * `!config.get('seeded')` guard and insert FULL_SCHEMA_HTML, so the merged fragment ended up
+     * with the content TWICE -- a genuine data-corruption finding, not a test artifact, and not
+     * fixable with a better client-side guard since Y.XmlFragment inserts are concurrent-append
+     * CRDT operations that Yjs merges rather than deduplicates).
      *
-     * Empirically reproduced (throwaway probe, run and deleted, mirroring CONTEXT.md's own
-     * feasibility-probe methodology): two independent connect:false connections, both driven to
-     * `synced` BEFORE any relay pump (the true simultaneous window -- neither has observed the
-     * other's `config.seeded` flag), each independently pass the client-side guard and insert
-     * FULL_SCHEMA_HTML. Once pumped, the merged fragment contains the content TWICE (confirmed:
-     * `<heading level="1">Heading 1</heading>` appears 2 times, not 1, after
-     * pumpAtoB()+pumpBtoA()) -- a genuine data-corruption finding, not a test artifact.
+     * Phase 10 closed the race SERVER-SIDE (D-15): the client's seed effect is deleted entirely
+     * (EditorPage.tsx no longer calls `editor.commands.setContent` at all), and the server seeds
+     * the room's canonical Y.Doc once, before any client ever connects
+     * (backend/app/collab/seeding.py). No client can observe `seeded === false` for a doc that has
+     * content, so the race is unreachable from the client by construction.
      *
-     * This is NOT a fixable client-side guard bug: Y.XmlFragment structural inserts are
-     * concurrent-append CRDT operations, not last-write-wins like a Y.Map value set. Two clients
-     * that both observe `seeded === false` before either one's write propagates will ALWAYS both
-     * insert, and Yjs will merge (not deduplicate) both insertions -- this holds regardless of
-     * transport topology (peer-relay here, or the real star topology through the server's
-     * `RoomManager`-held canonical Y.Doc), because Yjs updates are commutative/associative by
-     * design. No change contained to the existing client-side effect (EditorPage.tsx:240-254)
-     * closes this window; the only fix that removes the race entirely is SERVER-SIDE seeding
-     * (the server seeds the room's Y.Doc once, before any client ever connects, so no client can
-     * observe `seeded === false`) -- exactly D-09's second branch.
-     *
-     * Per D-09: STOPPED here rather than attempting a fix in this phase. Escalated to
-     * ROADMAP.md as a new phase (10, "Collaborative Seed-Race: Server-Side Seeding") and recorded
-     * in ROADMAP.md's Deviations Register.
-     *
-     * The assertion below is written as the CORRECT expected behavior (exactly once) and is
-     * currently red for the reason documented above -- `it.fails` keeps this a living,
-     * executable reproduction (it will flip to a genuine, visible failure the moment the
-     * underlying race is fixed without this test being updated, which is the point) without
-     * failing the phase's `npm test` gate.
+     * This test now models that reality directly (D-17): the shared doc is pre-seeded, mirroring
+     * the server's seed-before-serve contract, BEFORE either tree renders -- then both connections
+     * are driven through the same true-simultaneous-window `sync()` timing the original
+     * reproduction used. It's a normal passing `it(...)`, not `it.fails(...)`, and stays a LIVING
+     * reproduction: if client-side seeding were ever reintroduced, this test would go red again
+     * exactly like the original did (two inserts into an already-seeded doc, exactly-once
+     * assertion fails).
      */
-    it.fails('asserts seeded content appears exactly once after the simultaneous-window race (currently red -- see comment; escalated per D-08/D-09)', async () => {
+    it('asserts seeded content appears exactly once when both clients observe an already server-seeded doc', async () => {
       const connA = makeConnection('race-doc')
       const connB = makeConnection('race-doc')
       connectionsToDestroy.push(connA, connB)
@@ -298,6 +209,14 @@ describe('EditorPage', () => {
       registerDoc(makeDocFull({ id: 'race-doc', content_html: FULL_SCHEMA_HTML }))
 
       const relay = createManualRelay(connA.doc, connB.doc)
+
+      // Server-side pre-seed (D-08/D-15): the room's canonical doc is already seeded before any
+      // client connects. Seed connA's doc directly, then relay that single seed update to connB
+      // right away -- both connections observe an already-seeded doc from their very first render,
+      // exactly like a real WebsocketProvider handshake replaying a canonical room's existing
+      // state, rather than either client inserting anything itself.
+      seedDocServerStyle(connA.doc)
+      relay.pumpAtoB()
 
       const treeA = renderWithProviders(<EditorPage />, {
         path: '/documents/:id',
@@ -311,11 +230,9 @@ describe('EditorPage', () => {
       })
       await treeB.findByLabelText('Document title')
 
-      // The simultaneous window: BOTH connections reach `synced` -- and each independently runs
-      // its own seed effect -- BEFORE any pump call exchanges updates. Per D-04/RESEARCH.md's
-      // explicit rejection of an auto-relay: pumping inside the update handler would apply each
-      // side's insert to the other before its own seed effect ever re-checks the flag, closing
-      // this window and passing for the wrong reason.
+      // Same true-simultaneous window as the original reproduction: both connections reach
+      // `synced` before any further pump. Post-D-15 this window is inert by construction -- neither
+      // EditorPage instance has a seed effect left to run.
       await act(async () => {
         sync(connA)
         sync(connB)
@@ -329,7 +246,6 @@ describe('EditorPage', () => {
       })
 
       const mergedFragmentString = connA.doc.getXmlFragment('default').toString()
-      // Currently 2, not 1 -- see the escalation comment above.
       expect(countTag(mergedFragmentString, '<heading level="1">')).toBe(1)
     })
   })
@@ -380,13 +296,19 @@ describe('EditorPage', () => {
       await screen.findByLabelText('Document title')
 
       // Bind against connA first and confirm CollaborativeEditor genuinely mounted against it
-      // (seeded it) before the swap -- otherwise the assertion below wouldn't prove anything.
+      // -- otherwise the assertion below wouldn't prove anything. PHASE 10 (D-15): the original
+      // evidence mechanism here was the client's own seed effect (writing into connA.doc on
+      // `sync`); that effect no longer exists post-D-15, so this write comes from OUTSIDE the
+      // mounted tree instead (`writeContent`, simulating another peer/the server writing into the
+      // shared CRDT) -- discriminating on whether the mounted editor's rendered view reflects a
+      // live doc it's actually bound to, which is the same property the original assertion pinned.
       await act(async () => {
         sync(connA)
         await Promise.resolve()
       })
+      writeContent(connA.doc, '<p>marker-connA</p>')
       await waitFor(() => {
-        expect(connA.doc.getXmlFragment('default').toString()).not.toBe('')
+        expect(screen.getByText('marker-connA')).toBeInTheDocument()
       })
 
       // Replace the connection WITHOUT unmounting EditorInner -- exactly what a real reconnection
@@ -403,14 +325,15 @@ describe('EditorPage', () => {
       })
 
       // Discriminating assertion: with the key, CollaborativeEditor was torn down and rebuilt
-      // against connB, so seeding lands in connB's fragment. Without the key, the persisted
-      // CollaborativeEditor instance's `useEditor()` -- called with no explicit `deps` array, so
-      // @tiptap/react's EditorInstanceManager.refreshEditorInstance only recreates the editor when
-      // `deps.length !== 0` (frontend/node_modules/@tiptap/react/src/useEditor.ts, read during
-      // investigation) -- never rebinds, so the editor stays wired to connA's now-destroyed Y.Doc
-      // and connB's fragment never receives anything.
+      // against connB, so a write into connB.doc becomes visible in the rendered view. Without the
+      // key, the persisted CollaborativeEditor instance's `useEditor()` -- called with no explicit
+      // `deps` array, so @tiptap/react's EditorInstanceManager.refreshEditorInstance only recreates
+      // the editor when `deps.length !== 0` (frontend/node_modules/@tiptap/react/src/useEditor.ts,
+      // read during investigation) -- never rebinds, so the editor stays wired to connA's
+      // now-destroyed Y.Doc and a write into connB.doc never renders.
+      writeContent(connB.doc, '<p>marker-connB</p>')
       await waitFor(() => {
-        expect(connB.doc.getXmlFragment('default').toString()).not.toBe('')
+        expect(screen.getByText('marker-connB')).toBeInTheDocument()
       })
 
       // MUTATION-VALIDATION (D-11/D-24, executor-enforced, performed not deferred, DESIGN
@@ -426,11 +349,17 @@ describe('EditorPage', () => {
       // -- there is nothing for the key to protect in that construction. This CURRENT version --
       // driving the conn swap explicitly via `rerender()` instead of depending on StrictMode's
       // internal batching -- was then mutation-validated the same way: deleted the key, re-ran
-      // `npm test -- EditorPage`, confirmed THIS test went RED (the `waitFor` above timed out --
-      // connB's fragment stayed empty because the stale CollaborativeEditor instance kept writing
-      // into connA's destroyed Y.Doc). Restored EditorPage.tsx verbatim afterward (`git diff`
-      // confirmed empty) and re-ran the suite green. Full transcript of both rounds recorded in
-      // 09-06-SUMMARY.md.
+      // `npm test -- EditorPage`, confirmed THIS test went RED. Restored EditorPage.tsx verbatim
+      // afterward (`git diff` confirmed empty) and re-ran the suite green. Full transcript of both
+      // rounds recorded in 09-06-SUMMARY.md.
+      //
+      // PHASE 10 RE-VALIDATION (D-15): the discriminating write/assertion pair above was swapped
+      // from seed-effect fragment checks to direct `writeContent`/DOM-text checks (the seed effect
+      // it originally pinned on no longer exists). Re-ran the same mutation-validation procedure
+      // against THIS version: deleted the key, re-ran `npm test -- EditorPage`, confirmed this test
+      // went RED again (the second `waitFor` above timed out -- 'marker-connB' never appeared
+      // because the stale CollaborativeEditor instance stayed bound to connA's destroyed Y.Doc).
+      // Restored EditorPage.tsx verbatim (`git diff` confirmed empty) and re-ran the suite green.
     })
   })
 
