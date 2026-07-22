@@ -294,6 +294,32 @@ class RoomManager:
                     rec.room.ydoc.unobserve(rec.dirty_subscription)
                     rec.dirty_subscription = None
                     gc.collect()
+                # Persist any unsaved edit before discarding the crashed room,
+                # exactly as release()'s dirty-persist block below does. A dirty
+                # crashed room reclaimed HERE -- a second client opening the same
+                # doc_id before the first connection's
+                # `finally: await room_manager.release(doc_id)` runs -- would
+                # otherwise be popped with its edit still only in room.ydoc,
+                # reopening the REQ-collab-persistence data-loss window through
+                # get() instead of the send-crash path plans 11-01/11-02 closed.
+                # Same event-loop-thread derive + worker-thread persist, same
+                # RELEASE_SNAPSHOT_TIMEOUT bound, same log-and-continue contract
+                # as release(): a failed or slow rescue write is logged and the
+                # crashed room is still reclaimed, so it never blocks the fresh
+                # room the caller is waiting on.
+                if rec.dirty:
+                    try:
+                        html = snapshot.derive_snapshot_html(rec.room.ydoc)
+                        if html is not None:
+                            with fail_after(RELEASE_SNAPSHOT_TIMEOUT):
+                                await asyncio.to_thread(
+                                    snapshot.persist_snapshot_html, doc_id, html
+                                )
+                        rec.dirty = False
+                    except TimeoutError:
+                        log.error("snapshot persist timed out for doc %r", doc_id)
+                    except Exception:
+                        log.error("failed to write snapshot for doc %r", doc_id, exc_info=True)
                 self._rooms_by_id.pop(doc_id, None)
                 rec = None
             if rec is None:

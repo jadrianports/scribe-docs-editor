@@ -158,6 +158,76 @@ def test_crashed_room_persists_unsaved_edits_on_release(
     assert saved.content_html == "<p>stale</p><p>rescued edit</p>"
 
 
+def test_get_reclaim_of_dirty_crashed_room_persists_unsaved_edit(
+    tmp_path, monkeypatch, db_session, seed_users
+):
+    """CR-01 regression: a dirty crashed room reclaimed by `get()` -- a second
+    client opening the same doc_id BEFORE the first connection's
+    `finally: await room_manager.release(doc_id)` runs -- must persist the
+    unsaved edit before discarding the dead room, exactly as `release()` does.
+
+    Without get()'s reclaim-time persist, the edit lived only in the crashed
+    room's ydoc and was lost the instant get() popped the record and rebuilt
+    fresh from the (stale) content_html -- reopening the REQ-collab-persistence
+    data-loss window through a different trigger than the send-crash path plans
+    11-01/11-02 closed. The sibling `test_crashed_room_persists_unsaved_edits_on_release`
+    pins the release() path; this pins the get()-reclaim path. One test cannot
+    make both claims.
+    """
+    monkeypatch.chdir(tmp_path)
+    doc = Document(
+        id="cr01-reclaim-1",
+        title="C",
+        content_html="<p>stale</p>",
+        owner_id=seed_users["alice"].id,
+    )
+    db_session.add(doc)
+    db_session.commit()
+
+    async def crashing_start(self, **kwargs):
+        self.started.set()
+        self.ydoc_observed.set()
+        await anyio.sleep(0.05)
+        raise RuntimeError("boom: simulated room crash")
+
+    monkeypatch.setattr(YRoom, "start", crashing_start)
+
+    async def scenario():
+        mgr = RoomManager()
+
+        with anyio.fail_after(5):
+            room = await mgr.get("cr01-reclaim-1")  # server-seeds from "<p>stale</p>"
+        rec = mgr._rooms_by_id["cr01-reclaim-1"]
+
+        frag = room.ydoc.get("default", type=XmlFragment)
+        para = XmlElement("paragraph")
+        frag.children.append(para)
+        para.children.append(XmlText("rescued edit"))
+        assert rec.dirty is True  # a genuinely unsaved edit exists
+
+        await anyio.sleep(0.3)  # let the start task raise and the done-callback run
+        assert rec.crashed is True
+        assert "cr01-reclaim-1" in mgr._rooms_by_id
+
+        # A DIFFERENT client opens the same doc before release() runs. get()
+        # must reclaim the dead room AND persist its edit first, then rebuild.
+        with anyio.fail_after(5):
+            room2 = await mgr.get("cr01-reclaim-1")
+        assert room2 is not room
+        assert mgr._rooms_by_id["cr01-reclaim-1"].crashed is False
+        assert rec.dirty is False  # the reclaim persisted and cleared the flag
+
+        with anyio.fail_after(5):
+            await mgr.release("cr01-reclaim-1")
+
+    anyio.run(scenario)
+    gc.collect()
+
+    db_session.expire_all()  # the snapshot was written by a different Session
+    saved = db_session.get(Document, "cr01-reclaim-1")
+    assert saved.content_html == "<p>stale</p><p>rescued edit</p>"
+
+
 def test_crashed_room_release_ignores_refcount_and_second_release_is_a_no_op(
     tmp_path, monkeypatch, db_session, seed_users
 ):
