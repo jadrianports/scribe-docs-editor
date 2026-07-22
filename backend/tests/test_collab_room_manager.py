@@ -158,6 +158,165 @@ def test_crashed_room_persists_unsaved_edits_on_release(
     assert saved.content_html == "<p>stale</p><p>rescued edit</p>"
 
 
+def test_crashed_room_release_ignores_refcount_and_second_release_is_a_no_op(
+    tmp_path, monkeypatch, db_session, seed_users
+):
+    """D-21's idempotency answer for REQ-collab-persistence: running the
+    crashed-room teardown twice on the same input writes once. A crashed
+    record's refcount is meaningless (a dead room cannot serve anyone), so
+    `release()` must bypass it -- proven here by calling `get()` TWICE
+    (count == 2) before the crash, then asserting the FIRST `release()`
+    still returns True and persists, and a SECOND `release()` for the same
+    doc_id is a genuine no-op (returns False, persists nothing further).
+    """
+    from app.collab import snapshot as collab_snapshot
+
+    persisted_calls = []
+    real_persist = collab_snapshot.persist_snapshot_html
+
+    def spying_persist(doc_id, html):
+        persisted_calls.append((doc_id, html))
+        real_persist(doc_id, html)
+
+    monkeypatch.setattr(collab_snapshot, "persist_snapshot_html", spying_persist)
+
+    monkeypatch.chdir(tmp_path)
+    doc = Document(
+        id="crash-refcount-1",
+        title="C",
+        content_html="<p>stale</p>",
+        owner_id=seed_users["alice"].id,
+    )
+    db_session.add(doc)
+    db_session.commit()
+
+    async def crashing_start(self, **kwargs):
+        self.started.set()
+        self.ydoc_observed.set()
+        await anyio.sleep(0.05)
+        raise RuntimeError("boom: simulated room crash")
+
+    monkeypatch.setattr(YRoom, "start", crashing_start)
+
+    async def scenario():
+        mgr = RoomManager()
+
+        with anyio.fail_after(5):
+            room = await mgr.get("crash-refcount-1")
+        with anyio.fail_after(5):
+            await mgr.get("crash-refcount-1")
+        rec = mgr._rooms_by_id["crash-refcount-1"]
+        assert rec.count == 2  # two "clients" hold this doc_id open
+
+        frag = room.ydoc.get("default", type=XmlFragment)
+        para = XmlElement("paragraph")
+        frag.children.append(para)
+        para.children.append(XmlText("rescued edit"))
+
+        await anyio.sleep(0.3)  # let the crash happen
+        assert rec.crashed is True
+
+        # First release() bypasses the refcount (D-21) even though a second
+        # "client" is still claimed connected -- and persists exactly once.
+        with anyio.fail_after(5):
+            evicted = await mgr.release("crash-refcount-1")
+        assert evicted is True
+        assert "crash-refcount-1" not in mgr._rooms_by_id
+        assert len(persisted_calls) == 1
+
+        # Second release() for the same doc_id is a genuine no-op.
+        with anyio.fail_after(5):
+            evicted_again = await mgr.release("crash-refcount-1")
+        assert evicted_again is False
+        assert len(persisted_calls) == 1  # still exactly one persist
+
+    anyio.run(scenario)
+    gc.collect()
+
+    db_session.expire_all()
+    saved = db_session.get(Document, "crash-refcount-1")
+    assert saved.content_html == "<p>stale</p><p>rescued edit</p>"
+
+
+def test_shutdown_flush_persists_a_crashed_room(tmp_path, monkeypatch, db_session, seed_users):
+    """D-23's concurrency answer for REQ-collab-persistence: two teardown
+    writers (`release()` and `shutdown_flush()`) can overlap on the same
+    crashed record, and exactly one write happens. This exercises the case
+    where the process exits while a crashed record still awaits its
+    `release()` -- `shutdown_flush()` is the only thing that saves those
+    edits in that scenario.
+
+    `shutdown_flush()` required no code change at all for this to work:
+    `list(self._rooms_by_id.values())` now includes crashed records for free
+    because `_on_done` stopped popping them, and its existing
+    `if not record.dirty: continue` already does the right thing.
+
+    This test exercises the two writers SEQUENTIALLY against one shared
+    record (shutdown_flush() first, then release()) -- it pins the
+    dirty-flag gate that makes an overlap safe, it does not schedule the two
+    writers concurrently and makes no claim to.
+    """
+    from app.collab import snapshot as collab_snapshot
+
+    persisted_calls = []
+    real_persist = collab_snapshot.persist_snapshot_html
+
+    def spying_persist(doc_id, html):
+        persisted_calls.append((doc_id, html))
+        real_persist(doc_id, html)
+
+    monkeypatch.setattr(collab_snapshot, "persist_snapshot_html", spying_persist)
+
+    monkeypatch.chdir(tmp_path)
+    doc = Document(
+        id="crash-flush-1", title="C", content_html="<p>stale</p>", owner_id=seed_users["alice"].id
+    )
+    db_session.add(doc)
+    db_session.commit()
+
+    async def crashing_start(self, **kwargs):
+        self.started.set()
+        self.ydoc_observed.set()
+        await anyio.sleep(0.05)
+        raise RuntimeError("boom: simulated room crash")
+
+    monkeypatch.setattr(YRoom, "start", crashing_start)
+
+    async def scenario():
+        mgr = RoomManager()
+
+        with anyio.fail_after(5):
+            room = await mgr.get("crash-flush-1")
+        rec = mgr._rooms_by_id["crash-flush-1"]
+
+        frag = room.ydoc.get("default", type=XmlFragment)
+        para = XmlElement("paragraph")
+        frag.children.append(para)
+        para.children.append(XmlText("rescued edit"))
+
+        await anyio.sleep(0.3)  # let the crash happen
+        assert rec.crashed is True
+        assert rec.dirty is True
+
+        # shutdown_flush() runs FIRST, before any release() call for this doc_id --
+        # the process-exit-while-crashed scenario.
+        await mgr.shutdown_flush()
+        assert len(persisted_calls) == 1
+        assert rec.dirty is False
+
+        # release() afterward finds the already-cleared dirty flag and writes nothing more.
+        with anyio.fail_after(5):
+            await mgr.release("crash-flush-1")
+        assert len(persisted_calls) == 1  # still exactly one persist
+
+    anyio.run(scenario)
+    gc.collect()
+
+    db_session.expire_all()
+    saved = db_session.get(Document, "crash-flush-1")
+    assert saved.content_html == "<p>stale</p><p>rescued edit</p>"
+
+
 def test_release_evicts_room_on_last_client(tmp_path, monkeypatch):
     """`get()` ref-counts shared access to the same doc_id (no duplicate
     room), and `release()` only fully evicts room+task+count once the last
