@@ -86,6 +86,78 @@ def test_crashed_room_is_marked_not_evicted_and_rebuilt_on_next_get(tmp_path, mo
     gc.collect()
 
 
+def test_crashed_room_persists_unsaved_edits_on_release(
+    tmp_path, monkeypatch, db_session, seed_users
+):
+    """The single assertion plan 11-02 exists to make pass: a room that
+    genuinely crashed, holding a genuinely unsaved edit, has that edit land in
+    `documents.content_html` once the connection's `release()` runs.
+
+    Uses a synthetic in-process crash, not a real socket, and this is a
+    structural necessity, not a convenience: once plan 11-01's send guard
+    ships, a real disconnect no longer crashes a room at all, so a
+    real-socket test can no longer produce a crashed room to persist from.
+    "A crashed room persists" therefore needs a synthetic crash (here);
+    "disconnects no longer crash rooms" needs the real socket
+    (`test_disconnect_does_not_crash_room_and_persists_edit` in
+    test_collab_access.py, plan 11-01). One test cannot make both claims.
+
+    Also pins Task 1's guarded `stop()`: because `crashing_start` replaces
+    `YRoom.start`, the room's `_task_group` is never set, so `YRoom.stop()`
+    raises `RuntimeError("YRoom not running")` inside `release()` --
+    without the guard, `release()` would raise and this test would fail
+    before ever reaching its final assertion. That is a property this test
+    happens to pin, not a claim it makes as a second test.
+    """
+    monkeypatch.chdir(tmp_path)  # yjs.db lands under a throwaway ./data
+    doc = Document(
+        id="crash-persist-1",
+        title="C",
+        content_html="<p>stale</p>",
+        owner_id=seed_users["alice"].id,
+    )
+    db_session.add(doc)
+    db_session.commit()
+
+    async def crashing_start(self, **kwargs):
+        self.started.set()
+        self.ydoc_observed.set()
+        await anyio.sleep(0.05)
+        raise RuntimeError("boom: simulated room crash")
+
+    monkeypatch.setattr(YRoom, "start", crashing_start)
+
+    async def scenario():
+        mgr = RoomManager()
+
+        with anyio.fail_after(5):
+            room = await mgr.get("crash-persist-1")  # server-seeds from "<p>stale</p>"
+        rec = mgr._rooms_by_id["crash-persist-1"]
+
+        frag = room.ydoc.get("default", type=XmlFragment)
+        para = XmlElement("paragraph")
+        frag.children.append(para)
+        para.children.append(XmlText("rescued edit"))
+        assert rec.dirty is True  # a genuinely unsaved edit exists, not merely a seeded room
+
+        await anyio.sleep(0.3)  # let the start task raise and the done-callback run
+        assert rec.crashed is True
+        assert "crash-persist-1" in mgr._rooms_by_id  # the precondition old behavior made impossible
+
+        with anyio.fail_after(5):
+            evicted = await mgr.release("crash-persist-1")
+        assert evicted is True
+        assert "crash-persist-1" not in mgr._rooms_by_id
+        assert rec.dirty is False
+
+    anyio.run(scenario)
+    gc.collect()
+
+    db_session.expire_all()  # the snapshot was written by a different Session
+    saved = db_session.get(Document, "crash-persist-1")
+    assert saved.content_html == "<p>stale</p><p>rescued edit</p>"
+
+
 def test_release_evicts_room_on_last_client(tmp_path, monkeypatch):
     """`get()` ref-counts shared access to the same doc_id (no duplicate
     room), and `release()` only fully evicts room+task+count once the last
