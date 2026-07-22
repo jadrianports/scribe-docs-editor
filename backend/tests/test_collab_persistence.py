@@ -3,6 +3,7 @@ import time
 
 import anyio
 from pycrdt import Doc, Map, Text, XmlElement, XmlFragment, XmlText
+from app.collab.channel import StarletteChannel
 from app.collab.rooms import RoomManager
 from app.models import Document
 
@@ -18,6 +19,70 @@ def test_updates_persist_across_room_restart(tmp_path, monkeypatch):
         room2 = await mgr.get("doc-1")  # fresh room, must rehydrate
         assert str(room2.ydoc.get("t", type=Text)) == "hello"
     anyio.run(scenario)
+
+
+def test_yjs_update_survives_a_failing_client_send(tmp_path, monkeypatch):
+    """D-15/D-16: `pycrdt/websocket/yroom.py`'s `_broadcast_updates` schedules
+    `start_soon(client.send, message)` (yroom.py:213) and
+    `start_soon(self.ystore.write, update)` (yroom.py:218) into the SAME shared
+    `self._task_group`, in the same loop iteration, for the same update -- confirmed by
+    reading the installed library. A raising `client.send` could therefore cancel the
+    in-flight durable `ystore.write` for that same update, meaning a durable-store loss
+    would not be bounded by `SCRIBE_SNAPSHOT_INTERVAL` at all. A real lost write was never
+    reproduced before this test existed -- `start_soon` only schedules, so the outcome is
+    timing-dependent. Plan 11-01's guard on `StarletteChannel.send` (broad `except
+    Exception`, latched `_closed`) means the send this test drives never raises, which
+    removes the only reachable trigger; this test settles the question empirically with
+    that guard in place and pins the post-guard behaviour so a future refactor cannot
+    quietly reopen it.
+    """
+    monkeypatch.chdir(tmp_path)  # yjs.db is created under ./data
+
+    class _FailingWebSocket:
+        """Stands in for a transport that is already gone -- `send_bytes` always raises,
+        simulating a send-after-close race at the exact moment `_broadcast_updates` fans
+        an update out to `self.clients`. `calls` proves the fan-out actually reached this
+        channel; a stub that's never invoked would make the test pass vacuously."""
+
+        def __init__(self):
+            self.calls = 0
+
+        async def send_bytes(self, message):
+            self.calls += 1
+            raise RuntimeError("simulated send-after-close")
+
+    async def scenario():
+        mgr = RoomManager()
+        room = await mgr.get("durable-1")
+
+        # Register a failing client the way YRoom.serve does (self.clients.add(channel)),
+        # without opening a real socket. Constructed here, inside scenario(), so the
+        # channel's anyio.Lock() is created with a running event loop.
+        failing_socket = _FailingWebSocket()
+        channel = StarletteChannel(failing_socket, "durable-1")
+        room.clients.add(channel)
+
+        # Drives _broadcast_updates, which in one loop iteration schedules the failing
+        # client.send AND self.ystore.write into the room's single shared task group.
+        room.ydoc.get("t", type=Text).insert(0, "survives")
+
+        await anyio.sleep(0.3)  # let both scheduled tasks run
+
+        # The failure actually happened (fan-out reached the failing channel)...
+        assert failing_socket.calls >= 1
+        # ...and was contained: the room did not crash. This is what discriminates "the
+        # update survived because the guard worked" from "the room died and something
+        # else happened to save it".
+        assert mgr._rooms_by_id["durable-1"].crashed is False
+
+        await mgr.release("durable-1")      # stops the room
+        room2 = await mgr.get("durable-1")  # fresh room -- can only rehydrate from yjs.db
+        assert str(room2.ydoc.get("t", type=Text)) == "survives"
+
+        await mgr.release("durable-1")
+
+    anyio.run(scenario)
+    gc.collect()
 
 
 def test_snapshot_written_when_room_empties(tmp_path, monkeypatch, db_session, seed_users):
