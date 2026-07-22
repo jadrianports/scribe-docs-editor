@@ -1,5 +1,9 @@
+import logging
+
 from anyio import Lock
 from pycrdt import Channel, YMessageType, YSyncMessageType
+
+log = logging.getLogger(__name__)
 
 
 class StarletteChannel(Channel):
@@ -9,14 +13,21 @@ class StarletteChannel(Channel):
         self._websocket = websocket
         self._path = path
         self._send_lock = Lock()
+        self._closed = False
 
     @property
     def path(self) -> str:
         return self._path
 
     async def send(self, message: bytes) -> None:
-        async with self._send_lock:
-            await self._websocket.send_bytes(message)
+        if self._closed:
+            return
+        try:
+            async with self._send_lock:
+                await self._websocket.send_bytes(message)
+        except Exception:
+            self._closed = True
+            log.debug("send failed for %r, closing channel", self._path, exc_info=True)
 
     async def recv(self) -> bytes:
         return bytes(await self._websocket.receive_bytes())
