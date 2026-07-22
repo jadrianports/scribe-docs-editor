@@ -14,6 +14,7 @@ import websockets
 from pycrdt import Doc, Text, YMessageType, create_update_message, handle_sync_message
 from starlette.websockets import WebSocketDisconnect
 
+from app.collab.channel import ReadOnlyChannel, StarletteChannel
 from app.models import Document
 from app.seed import DEMO_PASSWORD
 
@@ -103,6 +104,46 @@ def test_owner_can_connect(client, a_doc, login):
     login("alice@example.com")
     with client.websocket_connect(f"/api/collab/{a_doc.id}") as ws:
         assert ws.receive_bytes()  # server sends initial SYNC_STEP1
+
+
+def test_send_swallows_transport_failure_and_short_circuits():
+    """`StarletteChannel.send` must never let a transport failure escape:
+    pycrdt-websocket's `YRoom` fans sends out via
+    `self._task_group.start_soon(client.send, message)` (yroom.py:213) --
+    the room's own SHARED, persistent task group, not `serve()`'s
+    per-connection group. An exception escaping `send` cancels every
+    sibling task in that group, which kills the room for every other
+    client -- not just the one whose socket just closed. This is a plain
+    unit test with no sockets, no server, and no `RoomManager`: a stub
+    `send_bytes` raises a plain `RuntimeError` in place of the real
+    four-layer disconnect chain (websockets -> uvicorn -> starlette ->
+    RuntimeError); catching broad `Exception` (not an allow-list of those
+    four types) is the point of this test's substitution, not an
+    oversight.
+    """
+
+    class _FailingWebSocket:
+        def __init__(self):
+            self.calls = 0
+
+        async def send_bytes(self, message):
+            self.calls += 1
+            raise RuntimeError("simulated send-after-close")
+
+    async def scenario():
+        ws = _FailingWebSocket()
+        channel = StarletteChannel(ws, "doc-guard")
+        await channel.send(b"\x00")  # must return normally, not raise
+        await channel.send(b"\x01")  # latch: must short-circuit, not retry
+        assert ws.calls == 1
+
+        ro_ws = _FailingWebSocket()
+        ro_channel = ReadOnlyChannel(ro_ws, "doc-guard-ro")
+        await ro_channel.send(b"\x00")
+        await ro_channel.send(b"\x01")
+        assert ro_ws.calls == 1
+
+    anyio.run(scenario)
 
 
 # --- Task 10: same-origin-aware origin check (deploy-origin fix) ---
