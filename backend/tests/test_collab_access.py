@@ -1,6 +1,7 @@
 import gc
 import os
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -11,7 +12,16 @@ import anyio
 import httpx
 import pytest
 import websockets
-from pycrdt import Doc, Text, YMessageType, create_update_message, handle_sync_message
+from pycrdt import (
+    Doc,
+    Text,
+    XmlElement,
+    XmlFragment,
+    XmlText,
+    YMessageType,
+    create_update_message,
+    handle_sync_message,
+)
 from starlette.websockets import WebSocketDisconnect
 
 from app.collab.channel import ReadOnlyChannel, StarletteChannel
@@ -580,3 +590,94 @@ def test_concurrent_editor_inserts_at_same_position_both_survive_merged(live_ser
 
     anyio.run(scenario)
     gc.collect()
+
+
+def test_disconnect_does_not_crash_room_and_persists_edit(live_server, tmp_path):
+    """The user-visible proof for BACKLOG B-01: before Task 1's guard, ANY
+    client closing its socket while a broadcast was in flight raised out of
+    `StarletteChannel.send`, which crossed into `YRoom`'s own SHARED,
+    persistent task group (yroom.py:213) -- cancelling every sibling task in
+    that group, stopping awareness (yroom.py:270-274, the `Awareness not
+    started` RuntimeError), and killing the room for every other client.
+    This test drives one real, authenticated client through a normal
+    connect-edit-disconnect cycle against a real uvicorn subprocess and
+    asserts BOTH halves of the fix: the edit reaches `documents.content_html`
+    (`routers/collab.py`'s `finally: await room_manager.release(doc_id)`
+    turns the disconnect into a snapshot write) AND the uvicorn log contains
+    neither the room-crash error line nor the awareness-not-started symptom.
+    Asserting only one half would be too weak: a connection that silently
+    failed to establish would satisfy "no crash logged" vacuously, so the
+    positive `content_html` assertion is load-bearing alongside the negative
+    log assertions.
+
+    Alice owns the seeded "Project Roadmap" (an EDITOR channel, not
+    `ReadOnlyChannel`). Unlike the two tests above, this one edits the real
+    "default" XmlFragment root -- not a scratch root -- because
+    `content_html` is derived only from "default" (see
+    `app.collab.html.ydoc_to_html`'s module docstring); that's deliberate
+    here, since observing the persisted edit is the whole point.
+    """
+
+    ctx: dict[str, str] = {}
+
+    async def scenario() -> None:
+        cookie = _login(live_server, "alice@example.com")
+        doc_id = _roadmap_doc_id(live_server, cookie)
+        ctx["doc_id"] = doc_id
+
+        ws_url = live_server.replace("http://", "ws://", 1) + f"/api/collab/{doc_id}"
+        marker = f"DISCONNECT-{uuid.uuid4().hex}"
+        ctx["marker"] = marker
+
+        with anyio.fail_after(30):
+            async with websockets.connect(
+                ws_url, additional_headers={"Cookie": f"session={cookie}"}
+            ) as ws:
+                doc = Doc()
+                await _handshake(ws, doc)
+                await _drain(ws, doc, quiet=0.5)  # bring doc up to the server's seeded content
+
+                updates: list[bytes] = []
+                doc.observe(lambda event: updates.append(event.update))
+                with doc.transaction():
+                    frag = doc.get("default", type=XmlFragment)
+                    para = XmlElement("paragraph")
+                    frag.children.append(para)
+                    para.children.append(XmlText(marker))
+                for u in updates:
+                    await ws.send(create_update_message(u))
+
+                await anyio.sleep(0.5)  # let the update apply and broadcast
+            # `async with websockets.connect(...)` exit above is a normal
+            # client close -- the exact condition that used to kill the room.
+
+    anyio.run(scenario)
+    gc.collect()
+
+    doc_id = ctx["doc_id"]
+    marker = ctx["marker"]
+
+    db_path = tmp_path / "scribe.db"
+    deadline = time.monotonic() + 20.0
+    content_html = None
+    while time.monotonic() < deadline:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            row = conn.execute(
+                "SELECT content_html FROM documents WHERE id = ?", (doc_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        if row and row[0] and marker in row[0]:
+            content_html = row[0]
+            break
+        time.sleep(0.5)
+
+    assert content_html is not None and marker in content_html, (
+        f"marker {marker!r} never appeared in content_html; last read value: {content_html!r}"
+    )
+
+    log_path = tmp_path / "uvicorn.log"
+    log_text = log_path.read_text(errors="replace")
+    assert f"collab room '{doc_id}' crashed" not in log_text
+    assert "Awareness not started" not in log_text
