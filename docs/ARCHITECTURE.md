@@ -138,6 +138,17 @@ to deploy" story (above) true for this feature too.
   `RoomManager._create_room`, under the per-doc lock, before any client connects) so
   there is exactly one seed writer and it always runs before the first client is
   served — there is no window left in which two openers can race each other.
+- **A transport failure never costs a room its unsaved edits.** A client's socket
+  failing mid-broadcast is caught and swallowed at the channel adapter, which drops
+  that one client and nothing else — the room fans its sends out through its own
+  shared, long-lived task group, so letting an exception escape a single client's
+  send would cancel every sibling task in that group and take the whole room down
+  with it. If a room's background task dies for some other reason, its record is
+  **marked crashed** and kept in place rather than discarded, so the connection's
+  existing teardown path (`release()`) still finds it and still derives and persists
+  the room's final snapshot — exactly one writer runs at teardown either way. What
+  this does not change: a hard kill (SIGKILL, no chance to run the shutdown flush)
+  still costs at most one tick interval, same as the tradeoff above.
 - **Single instance only.** Rooms live in one process's memory; nothing fans updates
   out across instances. Fine for the single-service deploy this project ships
   (decision 4 already keeps everything to one process), but it's the one piece of this
