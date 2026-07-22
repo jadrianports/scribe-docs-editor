@@ -144,11 +144,14 @@ to deploy" story (above) true for this feature too.
   shared, long-lived task group, so letting an exception escape a single client's
   send would cancel every sibling task in that group and take the whole room down
   with it. If a room's background task dies for some other reason, its record is
-  **marked crashed** and kept in place rather than discarded, so the connection's
-  existing teardown path (`release()`) still finds it and still derives and persists
-  the room's final snapshot — exactly one writer runs at teardown either way. What
-  this does not change: a hard kill (SIGKILL, no chance to run the shutdown flush)
-  still costs at most one tick interval, same as the tradeoff above.
+  **marked crashed** and kept in place rather than discarded, and its unsaved edits
+  are derived and persisted before the dead room is let go — by whichever path
+  reaches it first: the disconnecting connection's own teardown (`release()`), or
+  another client reopening the same document, which reclaims the crashed record
+  through `get()` and persists its edit there before rebuilding a fresh room. Either
+  way the final snapshot is written exactly once before the crashed room is
+  discarded. What this does not change: a hard kill (SIGKILL, no chance to run the
+  shutdown flush) still costs at most one tick interval, same as the tradeoff above.
 - **Single instance only.** Rooms live in one process's memory; nothing fans updates
   out across instances. Fine for the single-service deploy this project ships
   (decision 4 already keeps everything to one process), but it's the one piece of this
