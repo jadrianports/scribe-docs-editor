@@ -32,12 +32,16 @@ from app.models import Document
 # before control returns to pytest and any later test's TestClient thread.
 
 
-def test_crashed_room_task_is_evicted(tmp_path, monkeypatch):
+def test_crashed_room_is_marked_not_evicted_and_rebuilt_on_next_get(tmp_path, monkeypatch):
     """A room whose background `start()` task crashes *after* `started` (and
-    `ydoc_observed`) are set must not linger in the cache: the done-callback
-    must log the exception and evict the room, so the next `get()` for the
-    same doc_id builds (and starts) a fresh room instead of being served by
-    one whose broadcaster/persistence task has died.
+    `ydoc_observed`) are set must NOT be popped from the cache: the
+    done-callback must log the exception and mark the record `crashed`,
+    deliberately leaving it in `_rooms_by_id` so the connection's own
+    `finally: await room_manager.release(doc_id)` (see
+    `backend/app/routers/collab.py`) can still reach it and run its existing
+    dirty-persist block -- the whole point of plan 11-02's mark-don't-pop fix
+    (D-03, D-04). `get()` must still never serve a crashed record: the next
+    `get()` for the same doc_id must treat it as absent and rebuild fresh.
     """
     monkeypatch.chdir(tmp_path)
 
@@ -64,12 +68,19 @@ def test_crashed_room_task_is_evicted(tmp_path, monkeypatch):
 
         await anyio.sleep(0.3)  # let the background task crash and the done-callback run
 
-        assert "doc-crash" not in mgr._rooms_by_id
+        rec = mgr._rooms_by_id["doc-crash"]
+        assert rec.crashed is True
+        assert rec.room is room  # retained, not popped -- same crashed room object
+        assert rec.ticker_task.cancelled() or rec.ticker_task.done()
+        assert rec.dirty_subscription is None
 
-        # A subsequent connection must get a fresh room, not the dead one.
+        # A subsequent connection must get a fresh room, not the dead one --
+        # get() treats the crashed record as absent and rebuilds.
         with anyio.fail_after(5):
             room2 = await mgr.get("doc-crash")
         assert room2 is not room
+        assert mgr._rooms_by_id["doc-crash"].room is room2
+        assert mgr._rooms_by_id["doc-crash"].crashed is False
 
     anyio.run(scenario)
     gc.collect()

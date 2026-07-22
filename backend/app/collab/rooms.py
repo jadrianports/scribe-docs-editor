@@ -51,7 +51,9 @@ class RoomRecord:
     Subscription so pycrdt's Rust-backed, thread-affine object is finalized
     by ordinary refcounting on the event-loop thread that created it, rather
     than surviving to be swept by CPython's cyclic GC on whatever thread
-    crosses its allocation threshold (D-08, D-30).
+    crosses its allocation threshold (D-08, D-30). `crashed` is written only
+    by `_make_crash_evictor`'s done-callback and read by `get()` and
+    `release()`.
     """
 
     doc_id: str
@@ -59,6 +61,7 @@ class RoomRecord:
     start_task: asyncio.Task
     count: int = 0
     dirty: bool = False
+    crashed: bool = False
     ticker_task: asyncio.Task | None = None
     dirty_subscription: object | None = None
 
@@ -233,10 +236,24 @@ class RoomManager:
         `doc_id` by the time this (necessarily late) callback runs, so a stale
         callback can never evict a healthy, unrelated room.
 
-        Also cancels the record's `ticker_task`, if any: a crashed room's
-        `ydoc` is of unknown validity, so no snapshot is ever derived from it
-        here -- the ticker is stopped outright, not given one last tick
-        (D-15).
+        The record is marked crashed here, not popped: the connection's own
+        `finally: await room_manager.release(doc_id)` (see
+        `backend/app/routers/collab.py`) still finds it, and `release()`'s
+        existing dirty-persist block becomes the one and only place that
+        derives and writes the crashed room's final snapshot -- no second
+        persist writer is added here. The ticker is still cancelled
+        immediately: `release()` is now guaranteed to persist on the way out,
+        so letting the ticker survive would buy nothing and would reintroduce
+        a stale-in-flight-tick race against that guaranteed final write.
+        `room.ydoc` is a valid CRDT sitting in process memory despite the
+        transport-level task-group cancellation that crashed it -- there is
+        nothing to classify or defend against here beyond
+        `derive_snapshot_html`'s existing `config.seeded` guard, which
+        `release()` already goes through unchanged. This supersedes Phase 6's
+        superseded crash-teardown decision, which held that a crashed room's
+        Y.Doc was of indeterminate validity and so no snapshot could ever be
+        derived from it; that premise does not survive BACKLOG B-01, where
+        the crash is a transport failure, not doc corruption.
         """
 
         def _on_done(task: asyncio.Task) -> None:
@@ -246,10 +263,10 @@ class RoomManager:
             if exc is None:
                 return
             log.error("collab room %r crashed", doc_id, exc_info=exc)
-            # Plain sync pop, no lock/await needed -- see identity-check note above.
+            # Plain sync lookup, no lock/await needed -- see identity-check note above.
             rec = self._rooms_by_id.get(doc_id)
             if rec is not None and rec.room is room:
-                self._rooms_by_id.pop(doc_id, None)
+                rec.crashed = True  # marked, not popped -- release() still reaches it (D-03, D-04)
                 if rec.ticker_task is not None:
                     rec.ticker_task.cancel()
                 if rec.dirty_subscription is not None:
@@ -263,6 +280,22 @@ class RoomManager:
         lock = await self._lock_for(doc_id)
         async with lock:
             rec = self._rooms_by_id.get(doc_id)
+            if rec is not None and rec.crashed:
+                # A crashed record is treated as absent: nothing is ever
+                # served from it. Run the same event-loop-thread teardown
+                # triad `_create_room`'s except block uses, so the abandoned
+                # Subscription is finalized by refcounting here rather than
+                # left for a worker thread's cyclic GC to sweep later. This
+                # is where an orphaned crashed room (one whose clients never
+                # called release()) actually gets reclaimed: the cost is
+                # bounded to "until this document is next opened," which is
+                # why no separate sweeper task is needed (D-04, D-05).
+                if rec.dirty_subscription is not None:
+                    rec.room.ydoc.unobserve(rec.dirty_subscription)
+                    rec.dirty_subscription = None
+                    gc.collect()
+                self._rooms_by_id.pop(doc_id, None)
+                rec = None
             if rec is None:
                 rec = await self._create_room(doc_id)
                 self._rooms_by_id[doc_id] = rec
@@ -387,7 +420,19 @@ class RoomManager:
             rec = self._rooms_by_id.get(doc_id)
             if rec is None:
                 return False
-            rec.count -= 1
+            if rec.crashed:
+                # A dead room cannot serve anyone, so its refcount is
+                # meaningless: waiting for it to "drain" only delays the
+                # rescue persist below, and the remaining client(s)' sockets
+                # may be half-open or may never call release() at all.
+                # Forcing count to 0 here routes every crashed record
+                # through the exact same teardown body below, exactly once
+                # -- a later release() for the same doc_id then finds
+                # `rec is None` via the top-of-method branch above and
+                # returns False, no new code needed for that half.
+                rec.count = 0
+            else:
+                rec.count -= 1
             if rec.count <= 0:
                 room = rec.room
                 self._rooms_by_id.pop(doc_id)
@@ -418,6 +463,11 @@ class RoomManager:
                 # deterministically sweep any OTHER cyclic garbage YRoom or
                 # pycrdt-websocket may own before a worker thread can cross
                 # the threshold first.
+                # A crashed record's ticker was already cancelled
+                # synchronously inside `_on_done` -- this cancel is a no-op
+                # for that case, not a second cancellation site, so the
+                # exactly-one-writer invariant holds with no new code and no
+                # "one last tick" is ever given.
                 if rec.ticker_task is not None:
                     rec.ticker_task.cancel()
                     try:
@@ -447,12 +497,23 @@ class RoomManager:
                         if html is not None:
                             with fail_after(RELEASE_SNAPSHOT_TIMEOUT):
                                 await asyncio.to_thread(snapshot.persist_snapshot_html, doc_id, html)
+                        rec.dirty = False
                     except TimeoutError:
                         log.error("snapshot persist timed out for doc %r", doc_id)
                     except Exception:
                         log.error("failed to write snapshot for doc %r", doc_id, exc_info=True)
 
-                await room.stop()
+                # A crashed room's task group has already unwound (its own
+                # start() task is the one that crashed), so `YRoom.stop()`
+                # raises RuntimeError("YRoom not running") here -- exactly
+                # the state a crashed room is in. Skipping the call entirely
+                # would leak the YStore connection and the library's own
+                # `_subscription`, so log-and-continue instead (same pattern
+                # as the snapshot persist above and as _make_crash_evictor).
+                try:
+                    await room.stop()
+                except Exception:
+                    log.error("room.stop() failed for doc %r", doc_id, exc_info=True)
                 _drop_yroom_subscription(room)
                 return True
             return False
